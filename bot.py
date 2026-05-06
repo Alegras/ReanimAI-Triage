@@ -338,31 +338,88 @@ def bayesian_mortality(pt, apache, sofa, delta_sofa=None):
 # Решения (Decision Engine)
 # =============================
 def decisions(pt):
-    actions = []
-
-    if pt.get("map", 100) < 65:
-        actions.append("Норадреналин 0.05–0.3 мкг/кг/мин, цель MAP ≥ 65")
-
+    sofa = sofa_score(pt)
+    apache = apache_score(pt)
     pf = pf_ratio(pt)
-    need_vent = (pf is not None and pf < 150) or pt.get("gcs", 15) <= 8
-    if need_vent:
+    rec = []
+
+    # ── Гемодинамика ──────────────────────────────────────────
+    if pt.get("map", 100) < 65:
+        rec.append(
+            "Шок: норадреналин 0.05→0.3 мкг/кг/мин, "
+            "цель MAP ≥ 65; при рефрактерности — вазопрессин 0.03 ед/мин"
+        )
+    elif pt.get("map", 100) < 75 and pt.get("lactate", 0) >= 2:
+        rec.append("MAP 65–75 + лактат ↑ — болюс кристаллоидов 500 мл, переоценить через 30 мин")
+
+    # ── Дыхание / оксигенация ─────────────────────────────────
+    if pf is not None and pf < 100:
         w = pbw(pt.get("height"))
         vt = f"{int(w * 6)} мл" if w else "≈6 мл/кг ИМТ"
-        actions.append(f"ИВЛ: VT {vt}, PEEP по ARDSNet, Pplat < 30")
+        rec.append(
+            f"Тяжёлый ARDS (PF {pf}): VT {vt}, PEEP escalation по ARDSNet, "
+            f"Pplat < 30; прон-позиция ≥ 16 ч"
+        )
+    elif pf is not None and pf < 150:
+        w = pbw(pt.get("height"))
+        vt = f"{int(w * 6)} мл" if w else "≈6 мл/кг ИМТ"
+        rec.append(
+            f"ARDS (PF {pf}): VT {vt}, PEEP по ARDSNet, Pplat < 30"
+        )
+    elif pt.get("gcs", 15) <= 8:
+        rec.append("GCS ≤ 8 — оценить защиту дыхательных путей, показания к интубации")
 
-    if pt.get("lactate", 0) >= 2:
-        actions.append("Кристаллоиды 30 мл/кг, контроль лактата ч/з 2 ч")
+    if pt.get("spo2", 100) < 90 and pf is None:
+        rec.append("SpO₂ < 90% — высокопоточная O₂ или НИВ, контроль ABG")
 
-    if pt.get("wbc", 0) >= 15 or pt.get("temp", 36) > 38.5:
-        actions.append("Гемокультуры × 2, антибиотики — в первый час")
+    # ── Перфузия / лактат ─────────────────────────────────────
+    if pt.get("lactate", 0) >= 4:
+        rec.append(
+            "Лактат ≥ 4 — агрессивная ресусцитация, контроль каждые 2 ч; "
+            "цель клиренс > 10%"
+        )
+    elif pt.get("lactate", 0) >= 2:
+        rec.append(
+            "Лактат 2–4 — кристаллоиды 30 мл/кг, контроль каждые 2–4 ч; "
+            "цель клиренс > 10%"
+        )
 
+    # ── Инфекция / сепсис ─────────────────────────────────────
+    if sofa >= 2 and (pt.get("temp", 36) > 38 or pt.get("wbc", 0) >= 12 or pt.get("lactate", 0) >= 2):
+        rec.append(
+            "Sepsis bundle: гемокультуры × 2 → антибиотики < 1 ч → "
+            "source control; лактат, диурез"
+        )
+    elif pt.get("wbc", 0) >= 15 or pt.get("temp", 36) > 38.5:
+        rec.append("Гемокультуры × 2, антибиотики широкого спектра — в первый час")
+
+    # ── Почки ─────────────────────────────────────────────────
+    if pt.get("creatinine", 0) > 300 or pt.get("uop", 1) < 0.3:
+        rec.append(
+            "ОПП тяжёлое — нефролог, рассмотреть ЗПТ (CRRT); "
+            "диурез ≥ 0.5 мл/кг/ч, отменить нефротоксины"
+        )
+    elif pt.get("creatinine", 0) > 200:
+        rec.append(
+            "ОПП — контроль диуреза, рассмотреть ЗПТ при нарастании; "
+            "избегать нефротоксинов"
+        )
+
+    # ── Электролиты / КЩС ────────────────────────────────────
     if pt.get("potassium", 4) >= 6:
-        actions.append("Гиперкалиемия — Ca глюконат 10% 10 мл в/в, ЭКГ")
+        rec.append("Гиперкалиемия — Ca глюконат 10% 10 мл в/в, ЭКГ, инсулин + глюкоза")
+    elif pt.get("potassium", 4) < 3:
+        rec.append("Гипокалиемия — KCl в/в под ЭКГ-контролем, не > 20 мэкв/ч")
 
-    if pt.get("ph", 7.4) < 7.25:
-        actions.append("Ацидоз — NaHCO₃ при pH < 7.1, контроль ABG")
+    if pt.get("sodium", 140) < 125:
+        rec.append("Гипонатриемия — ограничение жидкости, 3% NaCl при симптомах")
 
-    return actions
+    if pt.get("ph", 7.4) < 7.20:
+        rec.append("Тяжёлый ацидоз — NaHCO₃ 1–2 ммоль/кг при pH < 7.1, контроль ABG")
+    elif pt.get("ph", 7.4) < 7.25:
+        rec.append("Ацидоз — контроль ABG, устранить причину; NaHCO₃ при pH < 7.1")
+
+    return rec[:6]
 
 
 # =============================
