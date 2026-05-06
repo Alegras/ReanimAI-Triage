@@ -1,6 +1,7 @@
 import os
 import re
 import math
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -518,6 +519,111 @@ LAC_TEXT = (
 
 
 # =============================
+# ЭКСПОРТ
+# =============================
+def build_export(pt):
+    apache = apache_score(pt)
+    sofa = sofa_score(pt)
+    qsofa = qsofa_score(pt)
+    level = triage_level(pt, apache, sofa)
+    r24, r30 = mortality(apache)
+    sep = is_sepsis(pt, sofa)
+    shock = shock_type(pt)
+    lc = lactate_clearance(pt)
+    aa = aa_gradient(pt)
+    pf = pf_ratio(pt)
+    acts = decisions(pt)
+    now = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+    labels = {
+        "age":        ("Возраст",      "лет"),
+        "height":     ("Рост",         "см"),
+        "sbp":        ("АД сист.",     "мм рт.ст."),
+        "map":        ("MAP",          "мм рт.ст."),
+        "hr":         ("ЧСС",          "/мин"),
+        "rr":         ("ЧД",           "/мин"),
+        "gcs":        ("GCS",          ""),
+        "temp":       ("Температура",  "°C"),
+        "spo2":       ("SpO₂",         "%"),
+        "pao2":       ("PaO₂",         "мм рт.ст."),
+        "fio2":       ("FiO₂",         ""),
+        "paco2":      ("PaCO₂",        "мм рт.ст."),
+        "hco3":       ("HCO₃",         "ммоль/л"),
+        "ph":         ("pH",           ""),
+        "sodium":     ("Натрий",       "ммоль/л"),
+        "potassium":  ("Калий",        "ммоль/л"),
+        "wbc":        ("Лейкоциты",    "×10⁹/л"),
+        "plt":        ("Тромбоциты",   "×10⁹/л"),
+        "creatinine": ("Креатинин",    "мкмоль/л"),
+        "bilirubin":  ("Билирубин",    "мкмоль/л"),
+        "lactate":    ("Лактат",       "ммоль/л"),
+        "uop":        ("Диурез",       "мл/кг/ч"),
+    }
+    skip = {"sbp", "lactate_history"}
+
+    vitals_keys = {"age", "height", "sbp", "map", "hr", "rr", "gcs", "temp", "spo2", "uop"}
+    abg_keys = {"pao2", "fio2", "paco2", "hco3", "ph"}
+    lab_keys = {"sodium", "potassium", "wbc", "plt", "creatinine", "bilirubin", "lactate"}
+
+    def section(keys):
+        lines = []
+        for k in keys:
+            if k in pt and k not in skip:
+                label, unit = labels.get(k, (k, ""))
+                lines.append(f"  {label}: {pt[k]} {unit}".rstrip())
+        return "\n".join(lines) if lines else "  —"
+
+    lines = [
+        "=" * 36,
+        "     КАРТА ПАЦИЕНТА — ICU CDSS",
+        f"     {now}",
+        "=" * 36,
+        "",
+        f"ТРИАЖ:    {level.replace('🔴 ', '').replace('🟡 ', '').replace('🟢 ', '')}",
+        f"APACHE II: {apache}",
+        f"SOFA:      {sofa}",
+        f"qSOFA:     {qsofa}/3",
+        f"Риск:      {r24}% (24ч) / {r30}% (30сут)",
+        f"Sepsis-3:  {'ДА' if sep else 'нет'}",
+    ]
+
+    if shock:
+        lines.append(f"Шок:       {shock}")
+    if pf is not None:
+        lines.append(f"PaO₂/FiO₂: {pf}")
+    if aa is not None:
+        lines.append(f"A-a град.: {aa}")
+    if lc is not None:
+        lines.append(f"Лактат-кл: {lc}%")
+
+    lines += [
+        "",
+        "── ВИТАЛЬНЫЕ ПОКАЗАТЕЛИ ──────────",
+        section(vitals_keys),
+        "",
+        "── ГАЗЫ КРОВИ (ABG) ──────────────",
+        section(abg_keys),
+        "",
+        "── ЛАБОРАТОРНЫЕ ДАННЫЕ ───────────",
+        section(lab_keys),
+    ]
+
+    if acts:
+        lines += ["", "── РЕКОМЕНДАЦИИ ──────────────────"]
+        for i, a in enumerate(acts, 1):
+            lines.append(f"  {i}. {a}")
+
+    lh = pt.get("lactate_history", [])
+    if len(lh) >= 2:
+        lines += ["", "── ДИНАМИКА ЛАКТАТА ──────────────"]
+        for i, v in enumerate(lh, 1):
+            lines.append(f"  [{i}] {v} ммоль/л")
+
+    lines += ["", "=" * 36]
+    return "\n".join(lines)
+
+
+# =============================
 # КНОПКИ
 # =============================
 def main_keyboard():
@@ -559,6 +665,19 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "  • Лактат:       лактат 3.2\n"
         "  • Диурез:       диурез 0.4\n\n"
         "Данные накапливаются — можно вводить частями."
+    )
+
+
+async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    if len([k for k in pt if k != "lactate_history"]) == 0:
+        await update.message.reply_text(
+            "Нет данных для экспорта. Введи данные пациента."
+        )
+        return
+    await update.message.reply_text(
+        f"```\n{build_export(pt)}\n```",
+        parse_mode="Markdown"
     )
 
 
@@ -621,6 +740,7 @@ def main():
 
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
