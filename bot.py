@@ -615,6 +615,115 @@ LAC_TEXT = (
 
 
 # =============================
+# ДАШБОРД
+# =============================
+def _val(pt, key, unit="", fmt=None):
+    v = pt.get(key)
+    if v is None:
+        return "—"
+    return f"{fmt.format(v) if fmt else v} {unit}".strip()
+
+def _flag(v, lo_bad=None, lo_warn=None, hi_warn=None, hi_bad=None):
+    if v is None:
+        return ""
+    if (lo_bad is not None and v < lo_bad) or (hi_bad is not None and v > hi_bad):
+        return " ❗"
+    if (lo_warn is not None and v < lo_warn) or (hi_warn is not None and v > hi_warn):
+        return " ⚠️"
+    return " ✓"
+
+def dashboard(pt):
+    apache = apache_score(pt)
+    sofa   = sofa_score(pt)
+    delta_sofa = pt.get("delta_sofa")
+    pf     = pf_ratio(pt)
+    lc     = lactate_clearance(pt)
+
+    # байесовская posterior (сырое значение для бара)
+    logit  = -3.5 + 0.15 * apache
+    prior  = 1 / (1 + math.exp(-logit))
+    lr = 1.0
+    if sofa >= 8:   lr *= 2.5
+    elif sofa >= 4: lr *= 1.5
+    if pt.get("lactate", 0) >= 4:  lr *= 2.0
+    elif pt.get("lactate", 0) >= 2: lr *= 1.3
+    if pt.get("map", 100) < 65:    lr *= 1.8
+    if delta_sofa is not None:
+        if delta_sofa > 2:   lr *= 2.2
+        elif delta_sofa > 0: lr *= 1.3
+        elif delta_sofa < 0: lr *= 0.7
+    odds = prior / (1 - prior)
+    post = min(0.99, (odds * lr) / (1 + odds * lr))
+    mort_pct = round(post * 100)
+
+    # визуальный бар смертности
+    filled = round(post * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+
+    # динамика SOFA
+    if delta_sofa is not None:
+        d_str = f"{delta_sofa:+d}"
+        d_ico = "📈" if delta_sofa > 0 else ("📉" if delta_sofa < 0 else "➡️")
+    else:
+        d_str, d_ico = "—", ""
+
+    # PF статус
+    if pf is None:
+        pf_str = "—"
+    elif pf < 100:
+        pf_str = f"{pf} ❗ тяжёлый ARDS"
+    elif pf < 200:
+        pf_str = f"{pf} ⚠️ умеренный"
+    elif pf < 300:
+        pf_str = f"{pf} ⚠️ лёгкий"
+    else:
+        pf_str = f"{pf} ✓"
+
+    map_v = pt.get("map")
+    gcs_v = pt.get("gcs")
+    rr_v  = pt.get("rr")
+    lac_v = pt.get("lactate")
+    cr_v  = pt.get("creatinine")
+    hr_v  = pt.get("hr")
+    t_v   = pt.get("temp")
+    sp_v  = pt.get("spo2")
+    uop_v = pt.get("uop")
+
+    lines = [
+        "🧾 ICU DASHBOARD",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "  ВИТАЛЬНЫЕ",
+        f"  🫀 MAP:  {map_v or '—'} мм рт.ст.{_flag(map_v, lo_bad=55, lo_warn=65, hi_warn=130, hi_bad=160)}",
+        f"  💓 ЧСС:  {hr_v or '—'} /мин{_flag(hr_v, lo_bad=40, lo_warn=55, hi_warn=110, hi_bad=140)}",
+        f"  🌡️ Темп: {t_v or '—'} °C{_flag(t_v, lo_warn=36, hi_warn=38.5, hi_bad=39)}",
+        f"  🫁 ЧД:   {rr_v or '—'} /мин{_flag(rr_v, hi_warn=25, hi_bad=35)}",
+        f"  🔵 SpO₂: {sp_v or '—'} %{_flag(sp_v, lo_bad=85, lo_warn=90)}",
+        f"  🧠 GCS:  {gcs_v or '—'}{_flag(gcs_v, lo_bad=9, lo_warn=13)}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "  ЛАБОРАТОРИЯ",
+        f"  🫁 P/F:     {pf_str}",
+        f"  🧪 Лактат: {lac_v or '—'} ммоль/л{_flag(lac_v, hi_warn=2, hi_bad=4)}",
+        f"  💧 Диурез: {uop_v or '—'} мл/кг/ч{_flag(uop_v, lo_bad=0.3, lo_warn=0.5)}",
+        f"  🫘 Кр-нин: {cr_v or '—'} мкмоль/л{_flag(cr_v, hi_warn=130, hi_bad=300)}",
+    ]
+    if lc is not None:
+        trend = "↓ улучшение" if lc > 0 else "↑ ухудшение"
+        lines.append(f"  📉 Лактат-клиренс: {lc}% {trend}")
+
+    lines += [
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "  СКОРИНГ",
+        f"  APACHE II: {apache}",
+        f"  SOFA:      {sofa}  {d_ico} ΔSOFA: {d_str}",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "  БАЙЕСОВСКАЯ СМЕРТНОСТЬ (30 сут)",
+        f"  [{bar}] {mort_pct}%",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    return "\n".join(lines)
+
+
+# =============================
 # ЭКСПОРТ
 # =============================
 def build_export(pt):
@@ -727,7 +836,8 @@ def build_export(pt):
 # =============================
 def main_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧮 Пересчитать",      callback_data="recalc"),
+        [InlineKeyboardButton("🧾 Дашборд",          callback_data="dash"),
+         InlineKeyboardButton("🧮 Пересчитать",      callback_data="recalc"),
          InlineKeyboardButton("❌ Сброс",             callback_data="clear")],
         [InlineKeyboardButton("🦠 Сепсис",           callback_data="sepsis"),
          InlineKeyboardButton("⚡ Шок",               callback_data="shock")],
@@ -804,7 +914,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     pt = get_pt(ctx)
 
-    if q.data == "recalc":
+    if q.data == "dash":
+        if len([k for k in pt if k not in ("lactate_history", "delta_sofa")]) == 0:
+            await q.message.reply_text("Нет данных. Введи данные пациента.")
+        else:
+            await q.message.reply_text(
+                f"```\n{dashboard(pt)}\n```",
+                parse_mode="Markdown"
+            )
+
+    elif q.data == "recalc":
         if len([k for k in pt if k != "lactate_history"]) == 0:
             await q.message.reply_text("Нет данных. Введи данные пациента.")
         else:
