@@ -1151,10 +1151,87 @@ def main_keyboard():
 
 
 # =============================
+# COMPLETENESS CHECK (SOFA)
+# =============================
+
+# Priority order — самое критичное спрашиваем первым
+SOFA_REQUIRED = [
+    ("cv",    "map"),
+    ("cns",   "gcs"),
+    ("renal", "creatinine"),
+    ("liver", "bilirubin"),
+    ("coag",  "plt"),
+    ("resp",  "pao2"),
+    ("resp",  "fio2"),
+]
+
+FIELD_NAMES = {
+    "map":        "MAP (среднее АД)",
+    "gcs":        "GCS (шкала ком)",
+    "creatinine": "креатинин",
+    "bilirubin":  "билирубин",
+    "plt":        "тромбоциты",
+    "pao2":       "PaO₂",
+    "fio2":       "FiO₂",
+}
+
+FIELD_HINTS = {
+    "map":
+        "❗ Нет MAP — гемодинамика не оценена.\n"
+        "Введи среднее АД (мм рт.ст.), напр. 62",
+    "gcs":
+        "❗ Нет GCS — ЦНС не оценена.\n"
+        "Введи баллы по ШКГ (3–15), напр. 13",
+    "creatinine":
+        "❗ Нет креатинина → риск ОПП не оценён.\n"
+        "Введи значение (мкмоль/л), напр. 280",
+    "bilirubin":
+        "❗ Нет билирубина → функция печени неизвестна.\n"
+        "Введи значение (мкмоль/л), напр. 40",
+    "plt":
+        "❗ Нет тромбоцитов → коагуляция не оценена.\n"
+        "Введи значение (×10⁹/л), напр. 120",
+    "pao2":
+        "❗ Нет PaO₂ → оксигенация не оценена.\n"
+        "Введи значение (мм рт.ст.), напр. 65",
+    "fio2":
+        "❗ Нет FiO₂ → оксигенация не оценена.\n"
+        "Введи долю кислорода (0.21–1.0), напр. 0.4",
+}
+
+# Целочисленные поля — конвертируем int при вводе
+_INT_FIELDS = {"gcs", "plt", "creatinine", "bilirubin"}
+
+
+def missing_sofa_fields(pt: dict, skipped: set) -> list:
+    return [
+        (sys_, field)
+        for sys_, field in SOFA_REQUIRED
+        if pt.get(field) is None and field not in skipped
+    ]
+
+
+def skip_keyboard(field: str) -> InlineKeyboardMarkup:
+    name = FIELD_NAMES.get(field, field)
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"⏭ Пропустить {name}", callback_data=f"skip:{field}")
+    ]])
+
+
+def _finalize(pt: dict, ctx) -> str:
+    """Вычисляем delta_sofa и возвращаем build_response."""
+    new_sofa = sofa_score(pt)
+    base = ctx.user_data.pop("_base_sofa", None)
+    if base is not None:
+        pt["delta_sofa"] = new_sofa - base
+    return build_response(pt)
+
+
+# =============================
 # ОБРАБОТЧИКИ
 # =============================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()
+    ctx.user_data.clear()   # сбрасывает skipped_fields, waiting_for, _base_sofa
     await update.message.reply_text(
         "ICU CDSS готов. Введи данные пациента.\n\n"
         "Поддерживаемые параметры:\n"
@@ -1193,22 +1270,53 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pt = get_pt(ctx)
-    prev_sofa = sofa_score(pt) if len([k for k in pt if k not in ("lactate_history", "delta_sofa")]) > 0 else None
-    parse(update.message.text, pt)
+    pt      = get_pt(ctx)
+    text    = update.message.text.strip()
+    skipped = ctx.user_data.setdefault("skipped_fields", set())
 
-    if len([k for k in pt if k not in ("lactate_history", "delta_sofa")]) == 0:
+    # ── Режим ожидания конкретного поля ──────────────────────────
+    if "waiting_for" in ctx.user_data:
+        field = ctx.user_data.pop("waiting_for")
+        try:
+            val = float(text.replace(",", "."))
+            pt[field] = int(val) if field in _INT_FIELDS else val
+        except ValueError:
+            ctx.user_data["waiting_for"] = field
+            await update.message.reply_text(
+                "Некорректное значение — введи число.",
+                reply_markup=skip_keyboard(field)
+            )
+            return
+
+    else:
+        # ── Обычный ввод: парсим свободный текст ─────────────────
+        has_data = any(k not in ("lactate_history", "delta_sofa") for k in pt)
+        ctx.user_data["_base_sofa"] = sofa_score(pt) if has_data else None
+        ctx.user_data["skipped_fields"] = set()          # новая порция — сброс пропусков
+        skipped = ctx.user_data["skipped_fields"]
+
+        parse(text, pt)
+
+        if not any(k not in ("lactate_history", "delta_sofa") for k in pt):
+            await update.message.reply_text(
+                "Не удалось распознать данные.\n"
+                "Отправь /start чтобы увидеть список параметров."
+            )
+            return
+
+    # ── Проверяем полноту SOFA ────────────────────────────────────
+    missing = missing_sofa_fields(pt, skipped)
+    if missing:
+        _, field = missing[0]
+        ctx.user_data["waiting_for"] = field
         await update.message.reply_text(
-            "Не удалось распознать данные.\n"
-            "Отправь /start чтобы увидеть список параметров."
+            FIELD_HINTS.get(field, f"❗ Нужен: {FIELD_NAMES.get(field, field)}"),
+            reply_markup=skip_keyboard(field)
         )
         return
 
-    new_sofa = sofa_score(pt)
-    if prev_sofa is not None:
-        pt["delta_sofa"] = new_sofa - prev_sofa
-
-    await update.message.reply_text(build_response(pt), reply_markup=main_keyboard())
+    # ── Все данные есть → считаем ─────────────────────────────────
+    await update.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard())
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1230,6 +1338,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Нет данных. Введи данные пациента.")
         else:
             await q.message.reply_text(build_response(pt), reply_markup=main_keyboard())
+
+    elif q.data.startswith("skip:"):
+        field = q.data.split(":", 1)[1]
+        skipped = ctx.user_data.setdefault("skipped_fields", set())
+        skipped.add(field)
+        ctx.user_data.pop("waiting_for", None)
+
+        missing = missing_sofa_fields(pt, skipped)
+        if missing:
+            _, next_field = missing[0]
+            ctx.user_data["waiting_for"] = next_field
+            await q.message.reply_text(
+                FIELD_HINTS.get(next_field, f"❗ Нужен: {FIELD_NAMES.get(next_field, next_field)}"),
+                reply_markup=skip_keyboard(next_field)
+            )
+        else:
+            await q.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard())
 
     elif q.data == "clear":
         ctx.user_data.clear()
