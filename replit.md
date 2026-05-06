@@ -9,21 +9,35 @@ A Telegram bot that parses Russian-language patient data, calculates an APACHE I
 
 ## Stack
 
-- Python 3
+- Python 3.11
 - python-telegram-bot 20.7
-- No database — stateless, per-message processing
+- pydantic 2.6 — Patient model, field validation, normalization
+- No database — stateless, per-user_data session
 
 ## Where things live
 
-- `bot.py` — all logic: parser, APACHE II scorer, Telegram handlers
+- `bot.py` — all logic in layered structure:
+  - `CONFIG` — configurable thresholds and targets (edit to tune rules)
+  - `Patient` (Pydantic) — validation/normalization model, derived features (pf, aa, ideal_weight)
+  - `parse()` — regex ingestion layer (Russian free-form text)
+  - `sofa_score()`, `apache_score()`, `qsofa_score()` — scoring layer
+  - `bayesian_mortality()` — probabilistic risk layer
+  - `alerts()` — critical/warning alert engine (🔴/🟡)
+  - `decisions()` — rule-based decision engine using CONFIG thresholds
+  - `interpret_abg()` — 5-step ABG analysis
+  - `dashboard()` — visual ICU monitor display
+  - `build_response()` — presentation layer (alerts first, then scores, then actions)
 
 ## Architecture decisions
 
-- APACHE II score is a simplified subset (age, temperature, MAP, RR, GCS, creatinine) — not the full 12-variable version
-- Patient data is parsed from free-form Russian text via regex
-- Token is loaded from `TELEGRAM_BOT_TOKEN` environment secret, never hardcoded
-- Risk percentages are capped at 99% to avoid absurd output
-- Bot runs in polling mode (no webhook needed for this use case)
+- Layered architecture: Ingestion → Normalization (Pydantic) → Scoring → Bayesian Risk → Alerts → Decisions → Presentation
+- CONFIG dict centralises all clinical thresholds — change MAP target, lactate cutoffs, etc. in one place
+- Pydantic Patient model validates incoming data (pH range, FiO₂ range, SpO₂ range) and exposes derived features; validation warnings surfaced to clinician in response
+- Alerts engine runs independently of decisions — critical flags (🔴) always appear at the top of the response
+- APACHE II score is a simplified subset (age, MAP, RR, GCS, creatinine)
+- Bayesian risk: APACHE II logistic prior × likelihood ratios for SOFA/lactate/MAP/ΔSOFA
+- Token loaded from `TELEGRAM_BOT_TOKEN` env secret, never hardcoded
+- Bot runs in polling mode
 
 ## Product
 

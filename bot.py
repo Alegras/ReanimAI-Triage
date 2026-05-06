@@ -2,6 +2,8 @@ import os
 import re
 import math
 from datetime import datetime
+from typing import Optional
+from pydantic import BaseModel, field_validator
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,6 +15,105 @@ from telegram.ext import (
 )
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+
+# =============================
+# CONFIG — настраиваемые пороги
+# =============================
+CONFIG = {
+    "targets": {
+        "map":               65,
+        "lactate_clearance": 0.10,
+        "spo2":              94,
+        "uop":               0.5,
+    },
+    "thresholds": {
+        "map_critical":      60,
+        "map_warn":          65,
+        "lactate_critical":  4.0,
+        "lactate_warn":      2.0,
+        "pf_severe":         150,
+        "pf_ards":           300,
+        "gcs_intubate":      8,
+        "gcs_warn":          13,
+        "creatinine_rrt":    300,
+        "creatinine_warn":   200,
+        "potassium_high":    6.0,
+        "potassium_low":     3.0,
+        "ph_critical":       7.20,
+        "ph_warn":           7.25,
+        "sofa_critical":     8,
+        "sofa_warn":         4,
+        "apache_critical":   25,
+        "apache_warn":       15,
+    },
+}
+
+# =============================
+# PATIENT MODEL (Pydantic — валидация и нормализация)
+# =============================
+class Patient(BaseModel):
+    age:        Optional[int]   = None
+    height:     Optional[int]   = None
+    sbp:        Optional[int]   = None
+    map:        Optional[float] = None
+    hr:         Optional[int]   = None
+    rr:         Optional[int]   = None
+    gcs:        Optional[int]   = None
+    temp:       Optional[float] = None
+    spo2:       Optional[int]   = None
+    pao2:       Optional[float] = None
+    fio2:       Optional[float] = None
+    paco2:      Optional[int]   = None
+    hco3:       Optional[int]   = None
+    ph:         Optional[float] = None
+    sodium:     Optional[int]   = None
+    potassium:  Optional[float] = None
+    chloride:   Optional[int]   = None
+    creatinine: Optional[int]   = None
+    bilirubin:  Optional[int]   = None
+    wbc:        Optional[float] = None
+    plt:        Optional[int]   = None
+    lactate:    Optional[float] = None
+    uop:        Optional[float] = None
+
+    @field_validator("ph")
+    @classmethod
+    def validate_ph(cls, v):
+        if v is not None and not (6.5 <= v <= 7.9):
+            raise ValueError(f"pH {v} вне диапазона 6.5–7.9")
+        return v
+
+    @field_validator("fio2")
+    @classmethod
+    def validate_fio2(cls, v):
+        if v is not None and not (0.21 <= v <= 1.0):
+            raise ValueError(f"FiO₂ {v} вне диапазона 0.21–1.0")
+        return v
+
+    @field_validator("spo2")
+    @classmethod
+    def validate_spo2(cls, v):
+        if v is not None and not (0 <= v <= 100):
+            raise ValueError(f"SpO₂ {v} вне диапазона 0–100")
+        return v
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Patient":
+        skip = {"lactate_history", "delta_sofa"}
+        return cls(**{k: v for k, v in d.items() if k not in skip})
+
+    def pf(self) -> Optional[float]:
+        if self.pao2 and self.fio2:
+            return round(self.pao2 / self.fio2, 1)
+        return None
+
+    def aa(self) -> Optional[float]:
+        if self.pao2 and self.fio2 and self.paco2:
+            return round(self.fio2 * (760 - 47) - self.paco2 / 0.8 - self.pao2, 1)
+        return None
+
+    def ideal_weight(self) -> Optional[float]:
+        return round(50 + 0.91 * (self.height - 152.4), 1) if self.height else None
 
 
 # =============================
@@ -338,89 +439,119 @@ def bayesian_mortality(pt, apache, sofa, delta_sofa=None):
 
 
 # =============================
+# ALERTS ENGINE
+# =============================
+def alerts(pt) -> list[str]:
+    T = CONFIG["thresholds"]
+    a = []
+
+    if pt.get("map") is not None and pt["map"] < T["map_critical"]:
+        a.append(f"🔴 КРИТИЧНО: MAP {pt['map']} — тяжёлая гипотензия")
+    if pt.get("lactate", 0) >= T["lactate_critical"]:
+        a.append(f"🔴 КРИТИЧНО: лактат {pt['lactate']} ммоль/л — тяжёлый шок")
+    if pt.get("gcs") is not None and pt["gcs"] <= T["gcs_intubate"]:
+        a.append(f"🔴 КРИТИЧНО: GCS {pt['gcs']} — риск аспирации, показания к интубации")
+
+    pf = pf_ratio(pt)
+    if pf is not None and pf < 100:
+        a.append(f"🔴 КРИТИЧНО: PaO₂/FiO₂ {pf} — тяжёлый ARDS")
+    if pt.get("ph") is not None and pt["ph"] < 7.15:
+        a.append(f"🔴 КРИТИЧНО: pH {pt['ph']} — жизнеугрожающий ацидоз")
+    if pt.get("potassium") is not None and pt["potassium"] >= 6.5:
+        a.append(f"🔴 КРИТИЧНО: K⁺ {pt['potassium']} — риск остановки сердца")
+    if pt.get("spo2") is not None and pt["spo2"] < 85:
+        a.append(f"🔴 КРИТИЧНО: SpO₂ {pt['spo2']}%")
+
+    if pt.get("map") is not None and T["map_critical"] <= pt["map"] < T["map_warn"]:
+        a.append(f"🟡 ВНИМАНИЕ: MAP {pt['map']} — гипотензия")
+    if pt.get("lactate", 0) >= T["lactate_warn"] and pt.get("lactate", 0) < T["lactate_critical"]:
+        a.append(f"🟡 ВНИМАНИЕ: лактат {pt['lactate']} — гиперлактатемия")
+    if pt.get("gcs") is not None and T["gcs_intubate"] < pt["gcs"] < T["gcs_warn"]:
+        a.append(f"🟡 ВНИМАНИЕ: GCS {pt['gcs']} — нарушение сознания")
+    if pt.get("creatinine", 0) >= T["creatinine_rrt"]:
+        a.append(f"🟡 ВНИМАНИЕ: Кр-нин {pt['creatinine']} — рассмотреть ЗПТ")
+
+    return a
+
+
+# =============================
 # Решения (Decision Engine)
 # =============================
 def decisions(pt):
+    T   = CONFIG["thresholds"]
+    TGT = CONFIG["targets"]
     sofa = sofa_score(pt)
-    apache = apache_score(pt)
-    pf = pf_ratio(pt)
-    rec = []
+    pf   = pf_ratio(pt)
+    rec  = []
 
     # ── Гемодинамика ──────────────────────────────────────────
-    if pt.get("map", 100) < 65:
+    if pt.get("map", 100) < TGT["map"]:
         rec.append(
-            "Шок: норадреналин 0.05→0.3 мкг/кг/мин, "
-            "цель MAP ≥ 65; при рефрактерности — вазопрессин 0.03 ед/мин"
+            f"Шок: норадреналин 0.05→0.3 мкг/кг/мин, цель MAP ≥ {TGT['map']}; "
+            "при рефрактерности — вазопрессин 0.03 ед/мин"
         )
-    elif pt.get("map", 100) < 75 and pt.get("lactate", 0) >= 2:
-        rec.append("MAP 65–75 + лактат ↑ — болюс кристаллоидов 500 мл, переоценить через 30 мин")
+    elif pt.get("map", 100) < 75 and pt.get("lactate", 0) >= T["lactate_warn"]:
+        rec.append("MAP 65–75 + лактат ↑ — болюс кристаллоидов 500 мл, переоценить ч/з 30 мин")
 
     # ── Дыхание / оксигенация ─────────────────────────────────
     if pf is not None and pf < 100:
-        w = pbw(pt.get("height"))
+        w  = pbw(pt.get("height"))
         vt = f"{int(w * 6)} мл" if w else "≈6 мл/кг ИМТ"
         rec.append(
-            f"Тяжёлый ARDS (PF {pf}): VT {vt}, PEEP escalation по ARDSNet, "
-            f"Pplat < 30; прон-позиция ≥ 16 ч"
+            f"Тяжёлый ARDS (PF {pf}): VT {vt}, PEEP escalation, Pplat < 30; прон ≥ 16 ч"
         )
-    elif pf is not None and pf < 150:
-        w = pbw(pt.get("height"))
+    elif pf is not None and pf < T["pf_severe"]:
+        w  = pbw(pt.get("height"))
         vt = f"{int(w * 6)} мл" if w else "≈6 мл/кг ИМТ"
-        rec.append(
-            f"ARDS (PF {pf}): VT {vt}, PEEP по ARDSNet, Pplat < 30"
-        )
-    elif pt.get("gcs", 15) <= 8:
-        rec.append("GCS ≤ 8 — оценить защиту дыхательных путей, показания к интубации")
+        rec.append(f"ARDS (PF {pf}): VT {vt}, PEEP по ARDSNet, Pplat < 30")
+    elif pt.get("gcs", 15) <= T["gcs_intubate"]:
+        rec.append(f"GCS ≤ {T['gcs_intubate']} — защита ДП, показания к интубации")
 
-    if pt.get("spo2", 100) < 90 and pf is None:
-        rec.append("SpO₂ < 90% — высокопоточная O₂ или НИВ, контроль ABG")
+    if pt.get("spo2", 100) < TGT["spo2"] and pf is None:
+        rec.append(f"SpO₂ < {TGT['spo2']}% — высокопоточная O₂ или НИВ, контроль ABG")
 
     # ── Перфузия / лактат ─────────────────────────────────────
-    if pt.get("lactate", 0) >= 4:
+    if pt.get("lactate", 0) >= T["lactate_critical"]:
         rec.append(
-            "Лактат ≥ 4 — агрессивная ресусцитация, контроль каждые 2 ч; "
-            "цель клиренс > 10%"
+            f"Лактат ≥ {T['lactate_critical']} — агрессивная ресусцитация, контроль каждые 2 ч; "
+            f"цель клиренс > {int(TGT['lactate_clearance']*100)}%"
         )
-    elif pt.get("lactate", 0) >= 2:
+    elif pt.get("lactate", 0) >= T["lactate_warn"]:
         rec.append(
-            "Лактат 2–4 — кристаллоиды 30 мл/кг, контроль каждые 2–4 ч; "
-            "цель клиренс > 10%"
+            f"Лактат ≥ {T['lactate_warn']} — кристаллоиды 30 мл/кг, контроль каждые 2–4 ч; "
+            f"цель клиренс > {int(TGT['lactate_clearance']*100)}%"
         )
 
     # ── Инфекция / сепсис ─────────────────────────────────────
-    if sofa >= 2 and (pt.get("temp", 36) > 38 or pt.get("wbc", 0) >= 12 or pt.get("lactate", 0) >= 2):
+    if sofa >= 2 and (pt.get("temp", 36) > 38 or pt.get("wbc", 0) >= 12 or
+                      pt.get("lactate", 0) >= T["lactate_warn"]):
         rec.append(
-            "Sepsis bundle: гемокультуры × 2 → антибиотики < 1 ч → "
-            "source control; лактат, диурез"
+            "Sepsis bundle: гемокультуры × 2 → антибиотики < 1 ч → source control"
         )
     elif pt.get("wbc", 0) >= 15 or pt.get("temp", 36) > 38.5:
         rec.append("Гемокультуры × 2, антибиотики широкого спектра — в первый час")
 
     # ── Почки ─────────────────────────────────────────────────
-    if pt.get("creatinine", 0) > 300 or pt.get("uop", 1) < 0.3:
+    if pt.get("creatinine", 0) > T["creatinine_rrt"] or pt.get("uop", 1) < 0.3:
         rec.append(
-            "ОПП тяжёлое — нефролог, рассмотреть ЗПТ (CRRT); "
-            "диурез ≥ 0.5 мл/кг/ч, отменить нефротоксины"
+            f"ОПП тяжёлое — нефролог, рассмотреть ЗПТ/CRRT; диурез ≥ {TGT['uop']} мл/кг/ч"
         )
-    elif pt.get("creatinine", 0) > 200:
-        rec.append(
-            "ОПП — контроль диуреза, рассмотреть ЗПТ при нарастании; "
-            "избегать нефротоксинов"
-        )
+    elif pt.get("creatinine", 0) > T["creatinine_warn"]:
+        rec.append("ОПП — контроль диуреза, рассмотреть ЗПТ при нарастании; без нефротоксинов")
 
     # ── Электролиты / КЩС ────────────────────────────────────
-    if pt.get("potassium", 4) >= 6:
+    if pt.get("potassium", 4) >= T["potassium_high"]:
         rec.append("Гиперкалиемия — Ca глюконат 10% 10 мл в/в, ЭКГ, инсулин + глюкоза")
-    elif pt.get("potassium", 4) < 3:
+    elif pt.get("potassium", 4) < T["potassium_low"]:
         rec.append("Гипокалиемия — KCl в/в под ЭКГ-контролем, не > 20 мэкв/ч")
 
     if pt.get("sodium", 140) < 125:
         rec.append("Гипонатриемия — ограничение жидкости, 3% NaCl при симптомах")
 
-    if pt.get("ph", 7.4) < 7.20:
-        rec.append("Тяжёлый ацидоз — NaHCO₃ 1–2 ммоль/кг при pH < 7.1, контроль ABG")
-    elif pt.get("ph", 7.4) < 7.25:
-        rec.append("Ацидоз — контроль ABG, устранить причину; NaHCO₃ при pH < 7.1")
+    if pt.get("ph", 7.4) < T["ph_critical"]:
+        rec.append(f"Тяжёлый ацидоз (pH < {T['ph_critical']}) — NaHCO₃, контроль ABG")
+    elif pt.get("ph", 7.4) < T["ph_warn"]:
+        rec.append("Ацидоз — устранить причину; NaHCO₃ при pH < 7.1")
 
     return rec[:6]
 
@@ -491,7 +622,22 @@ def build_response(pt):
         arrow = "↑" if delta_sofa > 0 else ("↓" if delta_sofa < 0 else "→")
         sofa_line += f"  ({arrow}{abs(delta_sofa):+d})"
 
-    lines = [
+    # Валидация через Pydantic (предупреждения о невалидных значениях)
+    validation_warns = []
+    try:
+        Patient.from_dict(pt)
+    except Exception as e:
+        validation_warns.append(f"⚠️ Данные: {e}")
+
+    al = alerts(pt)
+
+    lines = []
+    if al:
+        lines += ["🚨 АЛЕРТЫ:"] + al + [""]
+    if validation_warns:
+        lines += validation_warns + [""]
+
+    lines += [
         level,
         sofa_line,
         qsofa_line,
