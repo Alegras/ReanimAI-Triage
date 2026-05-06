@@ -1269,6 +1269,51 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt      = get_pt(ctx)
+    skipped = ctx.user_data.setdefault("skipped_fields", set())
+
+    SYSTEM_LABELS = {
+        "cv":    "Гемодинамика",
+        "cns":   "ЦНС",
+        "renal": "Почки",
+        "liver": "Печень",
+        "coag":  "Коагуляция",
+        "resp":  "Дыхание",
+    }
+
+    lines   = ["📋 SOFA — статус параметров:\n"]
+    buttons = []
+
+    for sys_, field in SOFA_REQUIRED:
+        name   = FIELD_NAMES.get(field, field)
+        val    = pt.get(field)
+        sys_lbl = SYSTEM_LABELS.get(sys_, sys_)
+
+        if val is not None:
+            lines.append(f"  ✅ {sys_lbl} / {name}: {val}")
+        elif field in skipped:
+            lines.append(f"  ⏭ {sys_lbl} / {name}: пропущено")
+            buttons.append([InlineKeyboardButton(
+                f"Ввести {name}", callback_data=f"enter:{field}"
+            )])
+        else:
+            lines.append(f"  ❗ {sys_lbl} / {name}: не задано")
+            buttons.append([InlineKeyboardButton(
+                f"Ввести {name}", callback_data=f"enter:{field}"
+            )])
+
+    if not buttons:
+        lines.append("\n✓ Все параметры заполнены — бот готов к расчёту.")
+        await update.message.reply_text("\n".join(lines))
+    else:
+        lines.append(f"\nНажми кнопку, чтобы ввести значение:")
+        await update.message.reply_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt      = get_pt(ctx)
     text    = update.message.text.strip()
@@ -1339,6 +1384,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await q.message.reply_text(build_response(pt), reply_markup=main_keyboard())
 
+    elif q.data.startswith("enter:"):
+        field = q.data.split(":", 1)[1]
+        skipped = ctx.user_data.setdefault("skipped_fields", set())
+        skipped.discard(field)                         # снимаем пропуск, если был
+        ctx.user_data["waiting_for"] = field
+        name = FIELD_NAMES.get(field, field)
+        await q.message.reply_text(
+            FIELD_HINTS.get(field, f"Введи {name}:"),
+            reply_markup=skip_keyboard(field)
+        )
+
     elif q.data.startswith("skip:"):
         field = q.data.split(":", 1)[1]
         skipped = ctx.user_data.setdefault("skipped_fields", set())
@@ -1393,8 +1449,9 @@ def main():
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Добавь его в секреты.")
 
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("export",  cmd_export))
+    app.add_handler(CommandHandler("missing", cmd_missing))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
