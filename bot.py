@@ -27,6 +27,7 @@ def parse_patient(text):
     if bp:
         sys_bp = int(bp.group(1))
         dia_bp = int(bp.group(2)) if bp.group(2) else int(sys_bp // 1.5)
+        data["sbp"] = sys_bp
         data["map"] = round((sys_bp + 2 * dia_bp) / 3)
 
     hr = re.search(r"(ЧСС|пульс)\s*(\d+)", text, re.I)
@@ -252,6 +253,29 @@ def sofa_score(d):
 
 
 # -----------------------------
+# qSOFA
+# -----------------------------
+def qsofa_score(d):
+    score = 0
+    if d.get("rr", 0) >= 22:
+        score += 1
+    if d.get("gcs", 15) < 15:
+        score += 1
+    if d.get("sbp", 120) <= 100:
+        score += 1
+    return score
+
+
+def qsofa_label(score):
+    if score >= 2:
+        return f"🔴 qSOFA: {score}/3 — высокий риск сепсиса"
+    elif score == 1:
+        return f"🟡 qSOFA: {score}/3 — наблюдение"
+    else:
+        return f"🟢 qSOFA: {score}/3 — низкий риск"
+
+
+# -----------------------------
 # Триаж
 # -----------------------------
 def triage_level(d, apache, sofa):
@@ -312,6 +336,7 @@ def build_protocol(d):
 def format_data(d):
     labels = {
         "age":        ("Возраст",      "лет"),
+        "sbp":        ("АД сист.",     "мм рт.ст."),
         "map":        ("MAP",          "мм рт.ст."),
         "hr":         ("ЧСС",          "/мин"),
         "rr":         ("ЧД",           "/мин"),
@@ -325,8 +350,11 @@ def format_data(d):
         "creatinine": ("Креатинин",    "мкмоль/л"),
         "bilirubin":  ("Билирубин",    "мкмоль/л"),
     }
+    skip = {"sbp"}
     lines = []
     for k, v in d.items():
+        if k in skip:
+            continue
         label, unit = labels.get(k, (k, ""))
         lines.append(f"  {label}: {v} {unit}".rstrip())
     return "\n".join(lines)
@@ -350,6 +378,7 @@ def main_keyboard():
 def build_response(data):
     apache = apache_score(data)
     sofa = sofa_score(data)
+    qsofa = qsofa_score(data)
     level = triage_level(data, apache, sofa)
     r24, r30 = mortality_risk(apache)
     steps, extras = build_protocol(data)
@@ -357,11 +386,14 @@ def build_response(data):
     lines = [
         f"{level}",
         f"📊 APACHE II: {apache}  |  SOFA: {sofa}",
+        qsofa_label(qsofa),
         f"⚠️ Риск: {r24}% (24ч)  |  {r30}% (30сут)",
         "",
         "✅ Протокол:",
         steps,
     ]
+    if qsofa >= 2:
+        lines += ["", "🦠 qSOFA ≥ 2 — исключить сепсис:", "  • Гемокультуры × 2", "  • Лактат крови", "  • А/б в первый час"]
     if extras:
         lines += ["", "🚨 Неотложно:", extras]
     lines += ["", "📋 Данные:", format_data(data)]
