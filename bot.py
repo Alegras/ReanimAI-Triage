@@ -73,6 +73,9 @@ def parse(text, pt):
     k = re.search(r"(калий|K)\s*([\d.]+)", text, re.I)
     if k:
         pt["potassium"] = float(k.group(2))
+    cl = re.search(r"(хлор|Cl)\s*(\d+)", text, re.I)
+    if cl:
+        pt["chloride"] = int(cl.group(2))
 
     # Лаборатория
     grab(r"креатинин\s*(\d+)", "creatinine", int)
@@ -615,6 +618,159 @@ LAC_TEXT = (
 
 
 # =============================
+# ИНТЕРПРЕТАЦИЯ КЩС (ABG)
+# =============================
+def interpret_abg(pt):
+    ph    = pt.get("ph")
+    paco2 = pt.get("paco2")
+    hco3  = pt.get("hco3")
+    na    = pt.get("sodium")
+    cl    = pt.get("chloride")
+    pao2  = pt.get("pao2")
+    fio2  = pt.get("fio2")
+
+    if not all([ph, paco2, hco3]):
+        return None
+
+    lines = [
+        "🧪 КЩС — ИНТЕРПРЕТАЦИЯ",
+        f"pH {ph}  PaCO₂ {paco2}  HCO₃ {hco3}",
+        "",
+    ]
+
+    # ── Шаг 1: оценка pH ──────────────────────────────────────
+    if ph < 7.35:
+        ph_str = "Ацидоз (pH < 7.35)"
+        disorder = "acidosis"
+    elif ph > 7.45:
+        ph_str = "Алкалоз (pH > 7.45)"
+        disorder = "alkalosis"
+    else:
+        ph_str = "pH в норме (7.35–7.45)"
+        disorder = "normal"
+    lines.append(f"1️⃣  {ph_str}")
+
+    # ── Шаг 2: первичное нарушение ────────────────────────────
+    primary = "unknown"
+    if disorder == "acidosis":
+        if paco2 > 45 and hco3 >= 22:
+            primary = "resp_acid"
+            lines.append("2️⃣  Первичное: дыхательный ацидоз (PaCO₂ ↑)")
+        elif hco3 < 22 and paco2 <= 45:
+            primary = "met_acid"
+            lines.append("2️⃣  Первичное: метаболический ацидоз (HCO₃ ↓)")
+        elif paco2 > 45 and hco3 < 22:
+            primary = "mixed_acid"
+            lines.append("2️⃣  Смешанное: дыхательный + метаболический ацидоз ❗")
+        else:
+            lines.append("2️⃣  Первичное нарушение неясно")
+
+    elif disorder == "alkalosis":
+        if paco2 < 35 and hco3 <= 26:
+            primary = "resp_alk"
+            lines.append("2️⃣  Первичное: дыхательный алкалоз (PaCO₂ ↓)")
+        elif hco3 > 26 and paco2 >= 35:
+            primary = "met_alk"
+            lines.append("2️⃣  Первичное: метаболический алкалоз (HCO₃ ↑)")
+        elif paco2 < 35 and hco3 > 26:
+            primary = "mixed_alk"
+            lines.append("2️⃣  Смешанное: дыхательный + метаболический алкалоз")
+        else:
+            lines.append("2️⃣  Первичное нарушение неясно")
+
+    else:
+        if paco2 < 35 and hco3 < 22:
+            lines.append("2️⃣  Компенсированное смешанное (дых. алкалоз + мет. ацидоз)")
+        elif paco2 > 45 and hco3 > 26:
+            lines.append("2️⃣  Компенсированное смешанное (дых. ацидоз + мет. алкалоз)")
+        else:
+            lines.append("2️⃣  Норма или полная компенсация")
+
+    # ── Шаг 3: компенсация ────────────────────────────────────
+    if primary == "met_acid":
+        exp = 1.5 * hco3 + 8
+        lines.append(f"3️⃣  Ожидаемый PaCO₂ (Winters): {exp-2:.0f}–{exp+2:.0f} мм рт.ст.")
+        if paco2 < exp - 2:
+            lines.append("    → PaCO₂ ниже ожидаемого: + дыхательный алкалоз")
+        elif paco2 > exp + 2:
+            lines.append("    → PaCO₂ выше ожидаемого: + дыхательный ацидоз")
+        else:
+            lines.append("    → Компенсация адекватная ✓")
+
+    elif primary == "met_alk":
+        exp = 0.7 * hco3 + 21
+        lines.append(f"3️⃣  Ожидаемый PaCO₂: {exp-2:.0f}–{exp+2:.0f} мм рт.ст.")
+        if paco2 < exp - 2:
+            lines.append("    → + дыхательный алкалоз")
+        elif paco2 > exp + 2:
+            lines.append("    → + дыхательный ацидоз")
+        else:
+            lines.append("    → Компенсация адекватная ✓")
+
+    elif primary == "resp_acid":
+        exp_acute   = 24 + (paco2 - 40) / 10
+        exp_chronic = 24 + 3.5 * (paco2 - 40) / 10
+        lines.append(f"3️⃣  Ожидаемый HCO₃:")
+        lines.append(f"    Острый:    {exp_acute:.1f}  |  Хронический: {exp_chronic:.1f} ммоль/л")
+        if hco3 < exp_acute - 2:
+            lines.append("    → + метаболический ацидоз")
+        elif hco3 > exp_chronic + 2:
+            lines.append("    → + метаболический алкалоз")
+        else:
+            lines.append("    → В пределах компенсации ✓")
+
+    elif primary == "resp_alk":
+        exp_acute   = 24 - 2   * (40 - paco2) / 10
+        exp_chronic = 24 - 5   * (40 - paco2) / 10
+        lines.append(f"3️⃣  Ожидаемый HCO₃:")
+        lines.append(f"    Острый:    {exp_acute:.1f}  |  Хронический: {exp_chronic:.1f} ммоль/л")
+        if hco3 < exp_chronic - 2:
+            lines.append("    → + метаболический ацидоз")
+        elif hco3 > exp_acute + 2:
+            lines.append("    → + метаболический алкалоз")
+        else:
+            lines.append("    → В пределах компенсации ✓")
+
+    # ── Шаг 4: анионный разрыв ────────────────────────────────
+    if na is not None and cl is not None:
+        ag = na - (cl + hco3)
+        lines.append(f"4️⃣  Анионный разрыв: {ag} мэкв/л (норма 8–12)")
+        if ag > 12:
+            lines.append("    → Высокий АР: лактат, кетоны, уремия, токсины (MUDPILES)")
+            if hco3 < 24:
+                delta_r = (ag - 12) / (24 - hco3)
+                lines.append(f"    Delta-ratio: {delta_r:.1f}")
+                if delta_r > 2:
+                    lines.append("    → + метаболический алкалоз поверх высокого АР")
+                elif delta_r >= 1:
+                    lines.append("    → Чистый высокий АР ацидоз")
+                else:
+                    lines.append("    → + нормальный АР ацидоз (гиперхлоремия)")
+        elif ag < 6:
+            lines.append("    → Низкий АР: гипоальбуминемия, миелома, ошибка измерения")
+        else:
+            lines.append("    → АР в норме ✓")
+    elif na is not None:
+        lines.append(f"4️⃣  Na − HCO₃ = {na - hco3} (добавь хлор: «Cl 102» для точного АР)")
+
+    # ── Шаг 5: оксигенация ────────────────────────────────────
+    if pao2 is not None and fio2 is not None:
+        pf = round(pao2 / fio2, 1)
+        aa = round(fio2 * (760 - 47) - paco2 / 0.8 - pao2, 1)
+        lines.append(f"5️⃣  PaO₂/FiO₂: {pf}  |  A-a градиент: {aa} мм рт.ст.")
+        if pf < 100:
+            lines.append("    → Тяжёлый ARDS (< 100)")
+        elif pf < 200:
+            lines.append("    → Умеренный ARDS (100–200)")
+        elif pf < 300:
+            lines.append("    → Лёгкий ARDS (200–300)")
+        else:
+            lines.append("    → Оксигенация в норме ✓")
+
+    return "\n".join(lines)
+
+
+# =============================
 # ДАШБОРД
 # =============================
 def _val(pt, key, unit="", fmt=None):
@@ -948,7 +1104,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(PRESS_TEXT)
 
     elif q.data == "abg":
-        await q.message.reply_text(ABG_TEXT)
+        interp = interpret_abg(pt)
+        if interp:
+            await q.message.reply_text(interp)
+        else:
+            await q.message.reply_text(ABG_TEXT)
 
     elif q.data == "lac":
         await q.message.reply_text(LAC_TEXT)
