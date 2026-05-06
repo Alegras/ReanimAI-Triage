@@ -1,0 +1,291 @@
+import re
+import math
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+
+TOKEN = "YOUR_BOT_TOKEN_HERE"
+
+# =============================
+# STATE
+# =============================
+def get_pt(ctx):
+    if "pt" not in ctx.user_data:
+        ctx.user_data["pt"] = {"history": [], "lactate_history": []}
+    return ctx.user_data["pt"]
+
+# =============================
+# PARSER
+# =============================
+def parse(text, pt):
+    def f(pattern, key, cast=float):
+        m = re.search(pattern, text, re.I)
+        if m:
+            pt[key] = cast(m.group(1))
+
+    # базовые
+    f(r'(\d+)\s*лет', "age", int)
+    bp = re.search(r'АД\s*(\d+)/(\d+)', text)
+    if bp:
+        sys, dia = int(bp.group(1)), int(bp.group(2))
+        pt["map"] = (sys + 2*dia)/3
+
+    f(r'GCS\s*(\d+)', "gcs", int)
+    f(r'ЧД\s*(\d+)', "rr", int)
+    f(r'температура\s*([\d\.]+)', "temp")
+
+    # лабы
+    f(r'креатинин\s*(\d+)', "creatinine")
+    f(r'билирубин\s*(\d+)', "bilirubin")
+    f(r'тромбоцит[ы]*\s*(\d+)', "plt")
+
+    # ABG
+    f(r'pH\s*([\d\.]+)', "ph")
+    f(r'PaCO2\s*(\d+)', "paco2")
+    f(r'HCO3\s*(\d+)', "hco3")
+
+    # оксигенация
+    f(r'PaO2\s*(\d+)', "pao2")
+    f(r'FiO2\s*([\d\.]+)', "fio2")
+    f(r'SpO2\s*(\d+)', "spo2")
+
+    # perfusion
+    f(r'лактат\s*([\d\.]+)', "lactate")
+    f(r'диурез\s*([\d\.]+)', "uop")
+
+    # рост
+    f(r'рост\s*(\d+)', "height")
+
+    return pt
+
+# =============================
+# PBW (идеальная масса)
+# =============================
+def pbw(height, male=True):
+    if not height:
+        return None
+    if male:
+        return 50 + 0.91*(height-152.4)
+    else:
+        return 45.5 + 0.91*(height-152.4)
+
+# =============================
+# A-a gradient
+# =============================
+def aa_gradient(pt):
+    if "pao2" in pt and "fio2" in pt and "paco2" in pt:
+        PAO2 = pt["fio2"]*(760-47) - pt["paco2"]/0.8
+        return PAO2 - pt["pao2"]
+    return None
+
+# =============================
+# SOFA
+# =============================
+def sofa(pt):
+    s=0
+    if "pao2" in pt and "fio2" in pt:
+        pf=pt["pao2"]/pt["fio2"]
+        if pf<100:s+=4
+        elif pf<200:s+=3
+        elif pf<300:s+=2
+        elif pf<400:s+=1
+
+    if "plt" in pt:
+        if pt["plt"]<20:s+=4
+        elif pt["plt"]<50:s+=3
+        elif pt["plt"]<100:s+=2
+        elif pt["plt"]<150:s+=1
+
+    if "bilirubin" in pt:
+        if pt["bilirubin"]>=204:s+=4
+        elif pt["bilirubin"]>=102:s+=3
+        elif pt["bilirubin"]>=33:s+=2
+
+    if pt.get("map",100)<70:s+=1
+
+    if "gcs" in pt:
+        if pt["gcs"]<6:s+=4
+        elif pt["gcs"]<10:s+=3
+        elif pt["gcs"]<13:s+=2
+
+    if "creatinine" in pt:
+        if pt["creatinine"]>=440:s+=4
+        elif pt["creatinine"]>=300:s+=3
+        elif pt["creatinine"]>=200:s+=2
+
+    return s
+
+# =============================
+# APACHE II simplified
+# =============================
+def apache(pt):
+    s=0
+    if pt.get("age",0)>=65:s+=5
+    if pt.get("map",100)<70:s+=2
+    if pt.get("rr",0)>=25:s+=1
+    if "gcs" in pt:s+=(15-pt["gcs"])
+    if pt.get("creatinine",0)>=220:s+=3
+    return s
+
+# =============================
+# Sepsis-3
+# =============================
+def sepsis(pt, sofa_score):
+    if sofa_score>=2 and (pt.get("temp",36)>38 or pt.get("lactate",0)>=2):
+        return True
+    return False
+
+# =============================
+# Lactate clearance
+# =============================
+def lactate_trend(pt):
+    if "lactate" in pt:
+        pt["lactate_history"].append(pt["lactate"])
+    if len(pt["lactate_history"])>=2:
+        l1, l2 = pt["lactate_history"][-2:]
+        return (l1-l2)/l1*100
+    return None
+
+# =============================
+# Shock type
+# =============================
+def shock_type(pt):
+    if pt.get("lactate",0)>2 and pt.get("map",100)<65:
+        return "дистрибутивный (септический)"
+    if pt.get("uop",1)<0.5:
+        return "гиповолемический"
+    return "неясный"
+
+# =============================
+# Decision Engine
+# =============================
+def decision(pt):
+    actions=[]
+
+    # vasopressors
+    if pt.get("map",100)<65:
+        actions.append("Норадреналин 0.05–0.3 мкг/кг/мин")
+
+    # ventilation
+    need_vent=False
+    if "pao2" in pt and "fio2" in pt:
+        if pt["pao2"]/pt["fio2"]<150:need_vent=True
+    if pt.get("gcs",15)<=8:need_vent=True
+
+    if need_vent:
+        weight=pbw(pt.get("height",170))
+        vt = int(weight*6) if weight else "≈6 мл/кг"
+        actions.append(f"ИВЛ: VT {vt}, PEEP по ARDSNet")
+
+    # fluids
+    if pt.get("lactate",0)>=2:
+        actions.append("Кристаллоиды 30 мл/кг")
+
+    return actions[:3]
+
+# =============================
+# TRIAGE
+# =============================
+def triage(pt):
+    if pt.get("map",100)<65 or pt.get("gcs",15)<13:
+        return "РЕАНИМАЦИЯ"
+    return "ПАЛАТА"
+
+# =============================
+# RESPONSE
+# =============================
+def build(pt):
+    s_sofa=sofa(pt)
+    s_apache=apache(pt)
+
+    tri=triage(pt)
+    mort=int((1/(1+math.exp(-(-3.5+0.15*s_apache))))*100)
+
+    r24=int(mort*0.4)
+
+    actions=decision(pt)
+    sep=sepsis(pt,s_sofa)
+    shock=shock_type(pt)
+    lact=lactate_trend(pt)
+    aa=aa_gradient(pt)
+
+    text=f"""🔴 ТРИАЖ: {tri}
+📊 APACHE II: {s_apache} | SOFA: {s_sofa}
+⚠️ Риск: {r24}% 24ч | {mort}% 30сут
+🧠 Sepsis-3: {"ДА" if sep else "НЕТ"}
+🫀 Шок: {shock}"""
+
+    if lact:
+        text+=f"\n📉 Lactate clearance: {lact:.1f}%"
+
+    if aa:
+        text+=f"\n🫁 A-a gradient: {int(aa)}"
+
+    text+="\n✅ Протокол:"
+    for i,a in enumerate(actions):
+        text+=f"\n{i+1}. {a}"
+
+    return text
+
+# =============================
+# UI
+# =============================
+def kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧮 Пересчитать", callback_data="recalc")],
+        [InlineKeyboardButton("🫁 ИВЛ", callback_data="vent")],
+        [InlineKeyboardButton("💉 Вазопрессоры", callback_data="press")],
+        [InlineKeyboardButton("🧪 ABG", callback_data="abg")],
+        [InlineKeyboardButton("📉 Лактат", callback_data="lac")],
+        [InlineKeyboardButton("❌ Сброс", callback_data="clear")]
+    ])
+
+# =============================
+# HANDLERS
+# =============================
+async def start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    await update.message.reply_text("ICU CDSS готов. Введи данные пациента.")
+
+async def msg(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    pt=get_pt(ctx)
+    parse(update.message.text,pt)
+    await update.message.reply_text(build(pt), reply_markup=kb())
+
+async def buttons(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query
+    await q.answer()
+
+    pt=get_pt(ctx)
+
+    if q.data=="recalc":
+        await q.message.reply_text(build(pt), reply_markup=kb())
+
+    elif q.data=="vent":
+        await q.message.reply_text("🫁 ARDSNet: VT 6 мл/кг, Pplat<30")
+
+    elif q.data=="press":
+        await q.message.reply_text("💉 Норадреналин ± вазопрессин")
+
+    elif q.data=="abg":
+        await q.message.reply_text("Введи: pH, PaCO2, HCO3, PaO2, FiO2")
+
+    elif q.data=="lac":
+        await q.message.reply_text("Введи лактат повторно")
+
+    elif q.data=="clear":
+        ctx.user_data.clear()
+        await q.message.reply_text("Сброшено")
+
+# =============================
+# RUN
+# =============================
+def main():
+    app=ApplicationBuilder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg))
+    app.add_handler(CallbackQueryHandler(buttons))
+    app.run_polling()
+
+if __name__=="__main__":
+    main()

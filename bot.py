@@ -1,5 +1,6 @@
 import os
 import re
+import math
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,329 +14,333 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 
-# -----------------------------
-# Парсинг
-# -----------------------------
-def parse_patient(text):
-    data = {}
+# =============================
+# STATE
+# =============================
+def get_pt(ctx):
+    if "pt" not in ctx.user_data:
+        ctx.user_data["pt"] = {"lactate_history": []}
+    return ctx.user_data["pt"]
 
-    age = re.search(r"(\d+)\s*(лет|год)", text, re.I)
-    if age:
-        data["age"] = int(age.group(1))
 
+# =============================
+# ПАРСИНГ (накопительный)
+# =============================
+def parse(text, pt):
+    def grab(pattern, key, cast=float):
+        m = re.search(pattern, text, re.I)
+        if m:
+            pt[key] = cast(m.group(1))
+
+    # Демография
+    grab(r"(\d+)\s*(лет|год)", "age", int)
+    grab(r"рост\s*(\d+)", "height", int)
+
+    # Гемодинамика
     bp = re.search(r"АД\s*(\d+)/?(\d*)", text)
     if bp:
         sys_bp = int(bp.group(1))
         dia_bp = int(bp.group(2)) if bp.group(2) else int(sys_bp // 1.5)
-        data["sbp"] = sys_bp
-        data["map"] = round((sys_bp + 2 * dia_bp) / 3)
+        pt["sbp"] = sys_bp
+        pt["map"] = round((sys_bp + 2 * dia_bp) / 3)
 
     hr = re.search(r"(ЧСС|пульс)\s*(\d+)", text, re.I)
     if hr:
-        data["hr"] = int(hr.group(2))
+        pt["hr"] = int(hr.group(2))
 
-    rr = re.search(r"ЧД\s*(\d+)", text)
-    if rr:
-        data["rr"] = int(rr.group(1))
+    # Дыхание
+    grab(r"ЧД\s*(\d+)", "rr", int)
+    grab(r"SpO2\s*(\d+)", "spo2", int)
+    grab(r"PaO2\s*(\d+)", "pao2", int)
+    grab(r"FiO2\s*([\d.]+)", "fio2")
+    grab(r"PaCO2\s*(\d+)", "paco2", int)
+    grab(r"HCO3\s*(\d+)", "hco3", int)
 
-    gcs = re.search(r"GCS\s*(\d+)", text)
-    if gcs:
-        data["gcs"] = int(gcs.group(1))
+    # Неврология
+    grab(r"GCS\s*(\d+)", "gcs", int)
 
-    temp = re.search(r"температура\s*([\d.]+)", text, re.I)
-    if temp:
-        data["temp"] = float(temp.group(1))
+    # Температура
+    grab(r"температура\s*([\d.]+)", "temp")
 
-    spo2 = re.search(r"SpO2\s*(\d+)", text, re.I)
-    if spo2:
-        data["spo2"] = int(spo2.group(1))
+    # pH
+    grab(r"pH\s*([\d.]+)", "ph")
 
-    ph = re.search(r"pH\s*([\d.]+)", text, re.I)
-    if ph:
-        data["ph"] = float(ph.group(1))
-
+    # Электролиты
     na = re.search(r"(натрий|Na)\s*(\d+)", text, re.I)
     if na:
-        data["sodium"] = int(na.group(2))
-
+        pt["sodium"] = int(na.group(2))
     k = re.search(r"(калий|K)\s*([\d.]+)", text, re.I)
     if k:
-        data["potassium"] = float(k.group(2))
+        pt["potassium"] = float(k.group(2))
 
-    wbc = re.search(r"лейкоциты?\s*([\d.]+)", text, re.I)
-    if wbc:
-        data["wbc"] = float(wbc.group(1))
+    # Лаборатория
+    grab(r"креатинин\s*(\d+)", "creatinine", int)
+    grab(r"билирубин\s*(\d+)", "bilirubin", int)
+    grab(r"лейкоциты?\s*([\d.]+)", "wbc")
+    grab(r"тромбоцит[ы]*\s*(\d+)", "plt", int)
 
-    cr = re.search(r"креатинин\s*(\d+)", text, re.I)
-    if cr:
-        data["creatinine"] = int(cr.group(1))
+    # Перфузия
+    if re.search(r"лактат\s*([\d.]+)", text, re.I):
+        val = float(re.search(r"лактат\s*([\d.]+)", text, re.I).group(1))
+        pt["lactate"] = val
+        pt["lactate_history"].append(val)
 
-    bil = re.search(r"билирубин\s*(\d+)", text, re.I)
-    if bil:
-        data["bilirubin"] = int(bil.group(1))
+    grab(r"диурез\s*([\d.]+)", "uop")
 
-    return data
-
-
-# -----------------------------
-# APACHE II
-# -----------------------------
-def apache_score(d):
-    score = 0
-
-    if "age" in d:
-        if d["age"] >= 65:
-            score += 6
-        elif d["age"] >= 55:
-            score += 3
-
-    if "temp" in d:
-        t = d["temp"]
-        if t >= 41 or t < 30:
-            score += 4
-        elif t >= 39 or t < 32:
-            score += 3
-        elif t >= 38.5 or t < 34:
-            score += 1
-
-    if "map" in d:
-        m = d["map"]
-        if m >= 160 or m < 50:
-            score += 4
-        elif m >= 130 or m < 70:
-            score += 3
-        elif m >= 110:
-            score += 2
-
-    if "hr" in d:
-        h = d["hr"]
-        if h >= 180 or h < 40:
-            score += 4
-        elif h >= 140 or h < 55:
-            score += 3
-        elif h >= 110:
-            score += 2
-
-    if "rr" in d:
-        r = d["rr"]
-        if r >= 50 or r < 6:
-            score += 4
-        elif r >= 35:
-            score += 3
-        elif r >= 25 or r < 10:
-            score += 1
-
-    if "spo2" in d:
-        s = d["spo2"]
-        if s < 85:
-            score += 4
-        elif s < 90:
-            score += 3
-        elif s < 95:
-            score += 1
-
-    if "ph" in d:
-        ph = d["ph"]
-        if ph >= 7.7 or ph < 7.15:
-            score += 4
-        elif ph >= 7.6 or ph < 7.25:
-            score += 3
-        elif ph >= 7.5:
-            score += 1
-        elif ph < 7.33:
-            score += 2
-
-    if "sodium" in d:
-        na = d["sodium"]
-        if na >= 180 or na <= 110:
-            score += 4
-        elif na >= 160 or na < 120:
-            score += 3
-        elif na >= 155 or na < 130:
-            score += 2
-        elif na >= 150:
-            score += 1
-
-    if "potassium" in d:
-        k = d["potassium"]
-        if k >= 7 or k < 2.5:
-            score += 4
-        elif k >= 6:
-            score += 3
-        elif k >= 5.5 or (k >= 3 and k < 3.5):
-            score += 1
-        elif k < 3:
-            score += 2
-
-    if "creatinine" in d:
-        cr = d["creatinine"]
-        if cr >= 300:
-            score += 4
-        elif cr >= 170:
-            score += 3
-        elif cr >= 130:
-            score += 2
-
-    if "wbc" in d:
-        w = d["wbc"]
-        if w >= 40 or w < 1:
-            score += 4
-        elif w >= 20 or w < 3:
-            score += 2
-        elif w >= 15:
-            score += 1
-
-    if "gcs" in d:
-        score += max(0, 15 - d["gcs"])
-
-    return min(score, 71)
+    return pt
 
 
-# -----------------------------
-# SOFA
-# -----------------------------
-def sofa_score(d):
-    score = 0
+# =============================
+# РАСЧЁТЫ
+# =============================
 
-    # ЦНС — GCS
-    if "gcs" in d:
-        g = d["gcs"]
-        if g < 6:
-            score += 4
-        elif g < 10:
-            score += 3
-        elif g < 13:
-            score += 2
-        elif g < 15:
-            score += 1
-
-    # Сердечно-сосудистая — MAP
-    if "map" in d and d["map"] < 70:
-        score += 1
-
-    # Дыхание — SpO₂ как прокси
-    if "spo2" in d:
-        s = d["spo2"]
-        if s < 85:
-            score += 4
-        elif s < 90:
-            score += 3
-        elif s < 94:
-            score += 2
-        elif s < 97:
-            score += 1
-
-    # Печень — билирубин (мкмоль/л)
-    if "bilirubin" in d:
-        b = d["bilirubin"]
-        if b > 204:
-            score += 4
-        elif b >= 102:
-            score += 3
-        elif b >= 33:
-            score += 2
-        elif b >= 20:
-            score += 1
-
-    # Почки — креатинин (мкмоль/л)
-    if "creatinine" in d:
-        cr = d["creatinine"]
-        if cr > 440:
-            score += 4
-        elif cr >= 300:
-            score += 3
-        elif cr >= 171:
-            score += 2
-        elif cr >= 110:
-            score += 1
-
-    return score
+def pbw(height, male=True):
+    if not height:
+        return None
+    return round((50 if male else 45.5) + 0.91 * (height - 152.4), 1)
 
 
-# -----------------------------
+def aa_gradient(pt):
+    if "pao2" in pt and "fio2" in pt and "paco2" in pt:
+        pao2_alv = pt["fio2"] * (760 - 47) - pt["paco2"] / 0.8
+        return round(pao2_alv - pt["pao2"], 1)
+    return None
+
+
+def pf_ratio(pt):
+    if "pao2" in pt and "fio2" in pt and pt["fio2"] > 0:
+        return round(pt["pao2"] / pt["fio2"], 1)
+    return None
+
+
+def lactate_clearance(pt):
+    h = pt.get("lactate_history", [])
+    if len(h) >= 2 and h[-2] > 0:
+        return round((h[-2] - h[-1]) / h[-2] * 100, 1)
+    return None
+
+
+def shock_type(pt):
+    if pt.get("lactate", 0) > 2 and pt.get("map", 100) < 65:
+        return "дистрибутивный (септический)"
+    if pt.get("uop", 1) < 0.5:
+        return "гиповолемический"
+    return None
+
+
+# =============================
+# APACHE II (полный, 12 параметров)
+# =============================
+def apache_score(pt):
+    s = 0
+
+    if "age" in pt:
+        if pt["age"] >= 65: s += 6
+        elif pt["age"] >= 55: s += 3
+
+    if "temp" in pt:
+        t = pt["temp"]
+        if t >= 41 or t < 30: s += 4
+        elif t >= 39 or t < 32: s += 3
+        elif t >= 38.5 or t < 34: s += 1
+
+    if "map" in pt:
+        m = pt["map"]
+        if m >= 160 or m < 50: s += 4
+        elif m >= 130 or m < 70: s += 3
+        elif m >= 110: s += 2
+
+    if "hr" in pt:
+        h = pt["hr"]
+        if h >= 180 or h < 40: s += 4
+        elif h >= 140 or h < 55: s += 3
+        elif h >= 110: s += 2
+
+    if "rr" in pt:
+        r = pt["rr"]
+        if r >= 50 or r < 6: s += 4
+        elif r >= 35: s += 3
+        elif r >= 25 or r < 10: s += 1
+
+    pf = pf_ratio(pt)
+    if pf is not None:
+        if pf < 100: s += 4
+        elif pf < 200: s += 3
+        elif pf < 300: s += 2
+    elif "spo2" in pt:
+        sp = pt["spo2"]
+        if sp < 85: s += 4
+        elif sp < 90: s += 3
+        elif sp < 95: s += 1
+
+    if "ph" in pt:
+        ph = pt["ph"]
+        if ph >= 7.7 or ph < 7.15: s += 4
+        elif ph >= 7.6 or ph < 7.25: s += 3
+        elif ph >= 7.5: s += 1
+        elif ph < 7.33: s += 2
+
+    if "sodium" in pt:
+        na = pt["sodium"]
+        if na >= 180 or na <= 110: s += 4
+        elif na >= 160 or na < 120: s += 3
+        elif na >= 155 or na < 130: s += 2
+        elif na >= 150: s += 1
+
+    if "potassium" in pt:
+        k = pt["potassium"]
+        if k >= 7 or k < 2.5: s += 4
+        elif k >= 6: s += 3
+        elif k >= 5.5 or (3 <= k < 3.5): s += 1
+        elif k < 3: s += 2
+
+    if "creatinine" in pt:
+        cr = pt["creatinine"]
+        if cr >= 300: s += 4
+        elif cr >= 170: s += 3
+        elif cr >= 130: s += 2
+
+    if "wbc" in pt:
+        w = pt["wbc"]
+        if w >= 40 or w < 1: s += 4
+        elif w >= 20 or w < 3: s += 2
+        elif w >= 15: s += 1
+
+    if "gcs" in pt:
+        s += max(0, 15 - pt["gcs"])
+
+    return min(s, 71)
+
+
+# =============================
+# SOFA (полный, с PLT и PaO2/FiO2)
+# =============================
+def sofa_score(pt):
+    s = 0
+
+    pf = pf_ratio(pt)
+    if pf is not None:
+        if pf < 100: s += 4
+        elif pf < 200: s += 3
+        elif pf < 300: s += 2
+        elif pf < 400: s += 1
+    elif "spo2" in pt:
+        sp = pt["spo2"]
+        if sp < 85: s += 4
+        elif sp < 90: s += 3
+        elif sp < 94: s += 2
+        elif sp < 97: s += 1
+
+    if "plt" in pt:
+        p = pt["plt"]
+        if p < 20: s += 4
+        elif p < 50: s += 3
+        elif p < 100: s += 2
+        elif p < 150: s += 1
+
+    if "bilirubin" in pt:
+        b = pt["bilirubin"]
+        if b >= 204: s += 4
+        elif b >= 102: s += 3
+        elif b >= 33: s += 2
+        elif b >= 20: s += 1
+
+    if pt.get("map", 100) < 70:
+        s += 1
+
+    if "gcs" in pt:
+        g = pt["gcs"]
+        if g < 6: s += 4
+        elif g < 10: s += 3
+        elif g < 13: s += 2
+        elif g < 15: s += 1
+
+    if "creatinine" in pt:
+        cr = pt["creatinine"]
+        if cr > 440: s += 4
+        elif cr >= 300: s += 3
+        elif cr >= 171: s += 2
+        elif cr >= 110: s += 1
+
+    return s
+
+
+# =============================
 # qSOFA
-# -----------------------------
-def qsofa_score(d):
-    score = 0
-    if d.get("rr", 0) >= 22:
-        score += 1
-    if d.get("gcs", 15) < 15:
-        score += 1
-    if d.get("sbp", 120) <= 100:
-        score += 1
-    return score
+# =============================
+def qsofa_score(pt):
+    s = 0
+    if pt.get("rr", 0) >= 22: s += 1
+    if pt.get("gcs", 15) < 15: s += 1
+    if pt.get("sbp", 120) <= 100: s += 1
+    return s
 
 
-def qsofa_label(score):
-    if score >= 2:
-        return f"🔴 qSOFA: {score}/3 — высокий риск сепсиса"
-    elif score == 1:
-        return f"🟡 qSOFA: {score}/3 — наблюдение"
-    else:
-        return f"🟢 qSOFA: {score}/3 — низкий риск"
+# =============================
+# Sepsis-3
+# =============================
+def is_sepsis(pt, sofa):
+    return sofa >= 2 and (pt.get("temp", 36) > 38 or pt.get("lactate", 0) >= 2)
 
 
-# -----------------------------
+# =============================
 # Триаж
-# -----------------------------
-def triage_level(d, apache, sofa):
-    if apache >= 25 or sofa >= 8 or d.get("map", 100) < 65 or d.get("gcs", 15) < 10:
+# =============================
+def triage_level(pt, apache, sofa):
+    if apache >= 25 or sofa >= 8 or pt.get("map", 100) < 65 or pt.get("gcs", 15) < 10:
         return "🔴 РЕАНИМАЦИЯ"
-    elif apache >= 15 or sofa >= 4 or d.get("map", 100) < 75 or d.get("gcs", 15) < 13:
+    elif apache >= 15 or sofa >= 4 or pt.get("map", 100) < 75 or pt.get("gcs", 15) < 13:
         return "🟡 ИВЛ / ОИМ"
-    else:
-        return "🟢 ПАЛАТА"
+    return "🟢 ПАЛАТА"
 
 
-# -----------------------------
-# Риск смертности
-# -----------------------------
-def mortality_risk(apache):
-    if apache >= 25:
-        return min(99, 50 + apache // 2), min(99, 70 + apache // 3)
-    elif apache >= 15:
-        return min(99, 20 + apache // 3), min(99, 40 + apache // 4)
-    else:
-        return apache // 2, apache
+# =============================
+# Смертность (логистическая регрессия)
+# =============================
+def mortality(apache):
+    p30 = round(1 / (1 + math.exp(-(-3.5 + 0.146 * apache))) * 100)
+    p24 = round(p30 * 0.45)
+    return min(p24, 99), min(p30, 99)
 
 
-# -----------------------------
-# Динамический протокол
-# -----------------------------
-def build_protocol(d):
-    steps = [
-        "1. Клинический мониторинг",
-        "2. В/в доступ + базовые анализы",
-        "3. Контроль витals q1h",
-    ]
-    extras = []
-    if d.get("map", 100) < 70:
-        extras.append("⚡ Вазопрессоры (норадреналин)")
-    if d.get("spo2", 100) < 90:
-        extras.append("💨 Кислородотерапия / ИВЛ")
-    if d.get("ph", 7.4) < 7.25:
-        extras.append("🧪 Коррекция ацидоза (NaHCO₃)")
-    if d.get("wbc", 0) >= 15:
-        extras.append("🦠 Исключить сепсис — а/б терапия")
-    if d.get("potassium", 4) >= 6:
-        extras.append("⚠️ Гиперкалиемия — Ca глюконат, ЭКГ")
-    if d.get("potassium", 4) < 3:
-        extras.append("⚠️ Гипокалиемия — в/в коррекция")
-    if d.get("sodium", 140) < 125:
-        extras.append("⚠️ Гипонатриемия — ограничение жидкости")
-    if "hr" in d and (d["hr"] >= 140 or d["hr"] < 50):
-        extras.append("💔 Нарушение ритма — ЭКГ срочно")
-    if d.get("bilirubin", 0) >= 33:
-        extras.append("🟡 Печёночная дисфункция — контроль функции печени")
-    return "\n".join(steps), "\n".join(extras) if extras else None
+# =============================
+# Решения (Decision Engine)
+# =============================
+def decisions(pt):
+    actions = []
+
+    if pt.get("map", 100) < 65:
+        actions.append("Норадреналин 0.05–0.3 мкг/кг/мин, цель MAP ≥ 65")
+
+    pf = pf_ratio(pt)
+    need_vent = (pf is not None and pf < 150) or pt.get("gcs", 15) <= 8
+    if need_vent:
+        w = pbw(pt.get("height"))
+        vt = f"{int(w * 6)} мл" if w else "≈6 мл/кг ИМТ"
+        actions.append(f"ИВЛ: VT {vt}, PEEP по ARDSNet, Pplat < 30")
+
+    if pt.get("lactate", 0) >= 2:
+        actions.append("Кристаллоиды 30 мл/кг, контроль лактата ч/з 2 ч")
+
+    if pt.get("wbc", 0) >= 15 or pt.get("temp", 36) > 38.5:
+        actions.append("Гемокультуры × 2, антибиотики — в первый час")
+
+    if pt.get("potassium", 4) >= 6:
+        actions.append("Гиперкалиемия — Ca глюконат 10% 10 мл в/в, ЭКГ")
+
+    if pt.get("ph", 7.4) < 7.25:
+        actions.append("Ацидоз — NaHCO₃ при pH < 7.1, контроль ABG")
+
+    return actions
 
 
-# -----------------------------
+# =============================
 # Форматирование данных
-# -----------------------------
-def format_data(d):
+# =============================
+def format_data(pt):
     labels = {
         "age":        ("Возраст",      "лет"),
+        "height":     ("Рост",         "см"),
         "sbp":        ("АД сист.",     "мм рт.ст."),
         "map":        ("MAP",          "мм рт.ст."),
         "hr":         ("ЧСС",          "/мин"),
@@ -343,16 +348,23 @@ def format_data(d):
         "gcs":        ("GCS",          ""),
         "temp":       ("Температура",  "°C"),
         "spo2":       ("SpO₂",         "%"),
+        "pao2":       ("PaO₂",         "мм рт.ст."),
+        "fio2":       ("FiO₂",         ""),
+        "paco2":      ("PaCO₂",        "мм рт.ст."),
+        "hco3":       ("HCO₃",         "ммоль/л"),
         "ph":         ("pH",           ""),
         "sodium":     ("Натрий",       "ммоль/л"),
         "potassium":  ("Калий",        "ммоль/л"),
         "wbc":        ("Лейкоциты",    "×10⁹/л"),
+        "plt":        ("Тромбоциты",   "×10⁹/л"),
         "creatinine": ("Креатинин",    "мкмоль/л"),
         "bilirubin":  ("Билирубин",    "мкмоль/л"),
+        "lactate":    ("Лактат",       "ммоль/л"),
+        "uop":        ("Диурез",       "мл/кг/ч"),
     }
-    skip = {"sbp"}
+    skip = {"sbp", "lactate_history"}
     lines = []
-    for k, v in d.items():
+    for k, v in pt.items():
         if k in skip:
             continue
         label, unit = labels.get(k, (k, ""))
@@ -360,149 +372,249 @@ def format_data(d):
     return "\n".join(lines)
 
 
-# -----------------------------
-# Инлайн-кнопки
-# -----------------------------
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Протокол сепсиса", callback_data="sepsis"),
-         InlineKeyboardButton("⚡ Протокол шока",    callback_data="shock")],
-        [InlineKeyboardButton("🔄 Пересчитать",      callback_data="recalc"),
-         InlineKeyboardButton("❌ Очистить",          callback_data="clear")],
-    ])
+# =============================
+# Построение ответа
+# =============================
+def build_response(pt):
+    apache = apache_score(pt)
+    sofa = sofa_score(pt)
+    qsofa = qsofa_score(pt)
+    level = triage_level(pt, apache, sofa)
+    r24, r30 = mortality(apache)
+    sep = is_sepsis(pt, sofa)
+    shock = shock_type(pt)
+    lc = lactate_clearance(pt)
+    aa = aa_gradient(pt)
+    pf = pf_ratio(pt)
+    acts = decisions(pt)
 
-
-# -----------------------------
-# Формирование ответа
-# -----------------------------
-def build_response(data):
-    apache = apache_score(data)
-    sofa = sofa_score(data)
-    qsofa = qsofa_score(data)
-    level = triage_level(data, apache, sofa)
-    r24, r30 = mortality_risk(apache)
-    steps, extras = build_protocol(data)
+    qsofa_line = (
+        f"🔴 qSOFA: {qsofa}/3 — высокий риск сепсиса" if qsofa >= 2
+        else f"🟡 qSOFA: {qsofa}/3 — наблюдение" if qsofa == 1
+        else f"🟢 qSOFA: {qsofa}/3"
+    )
 
     lines = [
-        f"{level}",
+        level,
         f"📊 APACHE II: {apache}  |  SOFA: {sofa}",
-        qsofa_label(qsofa),
+        qsofa_line,
         f"⚠️ Риск: {r24}% (24ч)  |  {r30}% (30сут)",
-        "",
-        "✅ Протокол:",
-        steps,
+        f"🧠 Sepsis-3: {'ДА' if sep else 'нет'}",
     ]
-    if qsofa >= 2:
-        lines += ["", "🦠 qSOFA ≥ 2 — исключить сепсис:", "  • Гемокультуры × 2", "  • Лактат крови", "  • А/б в первый час"]
-    if extras:
-        lines += ["", "🚨 Неотложно:", extras]
-    lines += ["", "📋 Данные:", format_data(data)]
 
+    if shock:
+        lines.append(f"🫀 Шок: {shock}")
+    if pf is not None:
+        lines.append(f"🫁 PaO₂/FiO₂: {pf}")
+    if aa is not None:
+        lines.append(f"🫁 A-a градиент: {aa}")
+    if lc is not None:
+        trend = "↓" if lc > 0 else "↑"
+        lines.append(f"📉 Лактат-клиренс: {lc}% {trend}")
+
+    if acts:
+        lines.append("\n✅ Решения:")
+        for i, a in enumerate(acts, 1):
+            lines.append(f"  {i}. {a}")
+
+    if qsofa >= 2:
+        lines += ["\n🦠 qSOFA ≥ 2 — скрининг сепсиса:", "  • Гемокультуры × 2", "  • Лактат", "  • А/б — в первый час"]
+
+    lines += ["\n📋 Данные:", format_data(pt)]
     return "\n".join(lines)
 
 
-# -----------------------------
-# Протоколы
-# -----------------------------
+# =============================
+# ПРОТОКОЛЫ
+# =============================
 SEPSIS_TEXT = (
     "🦠 ПРОТОКОЛ СЕПСИСА (Surviving Sepsis Campaign)\n\n"
     "Первый час:\n"
     "  1. Гемокультуры × 2 до антибиотиков\n"
-    "  2. Антибиотики широкого спектра — в первый час\n"
+    "  2. Антибиотики широкого спектра — немедленно\n"
     "  3. Кристаллоиды 30 мл/кг при MAP < 65\n"
-    "  4. Контроль лактата\n\n"
+    "  4. Лактат — измерить, повторить ч/з 2 ч\n\n"
     "Вазопрессоры:\n"
     "  • Норадреналин 0.01–3 мкг/кг/мин\n"
-    "  • Цель: MAP ≥ 65 мм рт.ст.\n\n"
+    "  • Цель: MAP ≥ 65 мм рт.ст.\n"
+    "  • Вазопрессин 0.03 ед/мин при рефрактерности\n\n"
     "Мониторинг:\n"
     "  • Диурез ≥ 0.5 мл/кг/ч\n"
-    "  • Лактат через 2 ч (цель < 2 ммоль/л)"
+    "  • Лактат < 2 ммоль/л — цель\n"
+    "  • ScvO₂ ≥ 70%"
 )
 
 SHOCK_TEXT = (
     "⚡ ПРОТОКОЛ ШОКА\n\n"
-    "Цели стабилизации:\n"
+    "Цели:\n"
     "  • MAP ≥ 65 мм рт.ст.\n"
     "  • ЧСС 60–100 /мин\n"
     "  • SpO₂ ≥ 94%\n"
     "  • Диурез ≥ 0.5 мл/кг/ч\n\n"
-    "Вазопрессоры:\n"
+    "Вазопрессоры (по приоритету):\n"
     "  1. Норадреналин — первая линия\n"
-    "  2. Вазопрессин 0.03 ед/мин — при рефрактерном шоке\n"
+    "  2. Вазопрессин 0.03 ед/мин\n"
     "  3. Эпинефрин — при кардиогенном компоненте\n\n"
     "Инфузия:\n"
-    "  • Кристаллоиды болюс 250–500 мл, оценить ответ\n"
-    "  • Избегать перегрузки — контроль ЦВД / эхо"
+    "  • Болюс 250–500 мл, оценить ответ\n"
+    "  • Контроль волемии: ЦВД / ЭхоКГ"
+)
+
+VENT_TEXT = (
+    "🫁 ИВЛ — ARDSNet протокол\n\n"
+    "Параметры:\n"
+    "  • VT: 6 мл/кг ИМТ (идеальная масса)\n"
+    "  • Pplat ≤ 30 см H₂O\n"
+    "  • DP (driving pressure) ≤ 15 см H₂O\n"
+    "  • PEEP: по таблице ARDSNet (FiO₂/PEEP)\n"
+    "  • ЧД: 14–35 /мин, рСО₂ цель 35–45\n\n"
+    "PaO₂/FiO₂:\n"
+    "  • > 300 — норма\n"
+    "  • 200–300 — лёгкий ARDS\n"
+    "  • 100–200 — умеренный\n"
+    "  • < 100 — тяжёлый → прон-позиция ≥ 16 ч\n\n"
+    "ПБМ (мужчины): 50 + 0.91 × (рост − 152.4)\n"
+    "ПБМ (женщины): 45.5 + 0.91 × (рост − 152.4)"
+)
+
+PRESS_TEXT = (
+    "💉 ВАЗОПРЕССОРЫ\n\n"
+    "1. Норадреналин (первая линия)\n"
+    "   0.01–3 мкг/кг/мин, цель MAP ≥ 65\n\n"
+    "2. Вазопрессин\n"
+    "   0.03–0.04 ед/мин — при рефрактерном шоке\n\n"
+    "3. Эпинефрин\n"
+    "   0.01–1 мкг/кг/мин — кардиогенный компонент\n\n"
+    "4. Добутамин\n"
+    "   2–20 мкг/кг/мин — при снижении СВ\n\n"
+    "Мониторинг:\n"
+    "  • АД инвазивное (A-line)\n"
+    "  • Лактат каждые 2 ч\n"
+    "  • Диурез ч/з мочевой катетер"
+)
+
+ABG_TEXT = (
+    "🧪 ABG — интерпретация\n\n"
+    "Нормы:\n"
+    "  pH: 7.35–7.45\n"
+    "  PaCO₂: 35–45 мм рт.ст.\n"
+    "  HCO₃: 22–26 ммоль/л\n"
+    "  PaO₂: 80–100 мм рт.ст.\n\n"
+    "Введи данные для пересчёта:\n"
+    "pH 7.28, PaCO2 38, HCO3 18, PaO2 65, FiO2 0.5"
+)
+
+LAC_TEXT = (
+    "📉 ЛАКТАТ\n\n"
+    "Интерпретация:\n"
+    "  < 2.0 ммоль/л — норма\n"
+    "  2–4 ммоль/л — гиперлактатемия\n"
+    "  > 4 ммоль/л — лактат-ацидоз\n\n"
+    "Клиренс (цель ≥ 10% за 2 ч):\n"
+    "  (Лактат₁ − Лактат₂) / Лактат₁ × 100%\n\n"
+    "Введи повторный лактат в сообщении:\n"
+    "лактат 1.8"
 )
 
 
-# -----------------------------
-# Обработчики
-# -----------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# =============================
+# КНОПКИ
+# =============================
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧮 Пересчитать",      callback_data="recalc"),
+         InlineKeyboardButton("❌ Сброс",             callback_data="clear")],
+        [InlineKeyboardButton("🦠 Сепсис",           callback_data="sepsis"),
+         InlineKeyboardButton("⚡ Шок",               callback_data="shock")],
+        [InlineKeyboardButton("🫁 ИВЛ / ARDSNet",    callback_data="vent"),
+         InlineKeyboardButton("💉 Вазопрессоры",     callback_data="press")],
+        [InlineKeyboardButton("🧪 ABG",               callback_data="abg"),
+         InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
+    ])
+
+
+# =============================
+# ОБРАБОТЧИКИ
+# =============================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
     await update.message.reply_text(
-        "Введи данные пациента в свободной форме.\n\n"
+        "ICU CDSS готов. Введи данные пациента.\n\n"
         "Поддерживаемые параметры:\n"
-        "  • Возраст:     67 лет\n"
-        "  • АД:          АД 90/60\n"
-        "  • ЧСС / пульс: ЧСС 110\n"
-        "  • ЧД:          ЧД 28\n"
-        "  • GCS:         GCS 12\n"
-        "  • Температура: температура 38.5\n"
-        "  • SpO₂:        SpO2 88\n"
-        "  • pH:          pH 7.28\n"
-        "  • Натрий:      натрий 148  или  Na 148\n"
-        "  • Калий:       калий 5.8   или  K 5.8\n"
-        "  • Лейкоциты:   лейкоциты 18.5\n"
-        "  • Креатинин:   креатинин 250\n"
-        "  • Билирубин:   билирубин 45\n\n"
-        "Пример:\n"
-        "67 лет, АД 90/60, ЧСС 110, ЧД 28, GCS 12, температура 38.5, "
-        "SpO2 88, pH 7.28, натрий 148, калий 5.8, лейкоциты 18.5, "
-        "креатинин 250, билирубин 45"
+        "  • Возраст:      67 лет\n"
+        "  • Рост:         рост 175\n"
+        "  • АД:           АД 90/60\n"
+        "  • ЧСС / пульс:  ЧСС 110\n"
+        "  • ЧД:           ЧД 28\n"
+        "  • GCS:          GCS 12\n"
+        "  • Температура:  температура 38.5\n"
+        "  • SpO₂:         SpO2 88\n"
+        "  • PaO₂/FiO₂:   PaO2 65, FiO2 0.5\n"
+        "  • ABG:          PaCO2 38, HCO3 18, pH 7.28\n"
+        "  • Натрий/Калий: Na 142, K 5.2\n"
+        "  • Лейкоциты:    лейкоциты 18.5\n"
+        "  • Тромбоциты:   тромбоциты 95\n"
+        "  • Креатинин:    креатинин 280\n"
+        "  • Билирубин:    билирубин 45\n"
+        "  • Лактат:       лактат 3.2\n"
+        "  • Диурез:       диурез 0.4\n\n"
+        "Данные накапливаются — можно вводить частями."
     )
 
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    data = parse_patient(text)
+async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    parse(update.message.text, pt)
 
-    if not data:
+    if len([k for k in pt if k != "lactate_history"]) == 0:
         await update.message.reply_text(
             "Не удалось распознать данные.\n"
-            "Отправь /start чтобы увидеть пример."
+            "Отправь /start чтобы увидеть список параметров."
         )
         return
 
-    context.user_data["last_data"] = data
-    await update.message.reply_text(build_response(data), reply_markup=main_keyboard())
+    await update.message.reply_text(build_response(pt), reply_markup=main_keyboard())
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pt = get_pt(ctx)
 
-    if query.data == "sepsis":
-        await query.message.reply_text(SEPSIS_TEXT)
-
-    elif query.data == "shock":
-        await query.message.reply_text(SHOCK_TEXT)
-
-    elif query.data == "recalc":
-        data = context.user_data.get("last_data")
-        if data:
-            await query.message.reply_text(build_response(data), reply_markup=main_keyboard())
+    if q.data == "recalc":
+        if len([k for k in pt if k != "lactate_history"]) == 0:
+            await q.message.reply_text("Нет данных. Введи данные пациента.")
         else:
-            await query.message.reply_text("Нет сохранённых данных. Введи данные пациента заново.")
+            await q.message.reply_text(build_response(pt), reply_markup=main_keyboard())
 
-    elif query.data == "clear":
-        context.user_data.clear()
-        await query.message.reply_text("Данные очищены.")
+    elif q.data == "clear":
+        ctx.user_data.clear()
+        await q.message.reply_text("Данные пациента сброшены.")
+
+    elif q.data == "sepsis":
+        await q.message.reply_text(SEPSIS_TEXT)
+
+    elif q.data == "shock":
+        await q.message.reply_text(SHOCK_TEXT)
+
+    elif q.data == "vent":
+        w = pbw(pt.get("height"))
+        extra = f"\n\nДля этого пациента (рост {pt['height']} см): VT = {int(w*6)} мл" if w else ""
+        await q.message.reply_text(VENT_TEXT + extra)
+
+    elif q.data == "press":
+        await q.message.reply_text(PRESS_TEXT)
+
+    elif q.data == "abg":
+        await q.message.reply_text(ABG_TEXT)
+
+    elif q.data == "lac":
+        await q.message.reply_text(LAC_TEXT)
 
 
-# -----------------------------
-# Запуск
-# -----------------------------
+# =============================
+# ЗАПУСК
+# =============================
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Добавь его в секреты.")
