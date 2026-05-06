@@ -75,6 +75,9 @@ class Patient(BaseModel):
     plt:        Optional[int]   = None
     lactate:    Optional[float] = None
     uop:        Optional[float] = None
+    weight:     Optional[int]   = None
+    norad_ml_h: Optional[float] = None
+    norad_mg:   Optional[float] = None
 
     @field_validator("ph")
     @classmethod
@@ -192,7 +195,59 @@ def parse(text, pt):
 
     grab(r"диурез\s*([\d.]+)", "uop")
 
+    # Антропометрия — вес
+    w = re.search(r"(?:вес|weight)\s*(\d+)", text, re.I)
+    if w:
+        pt["weight"] = int(w.group(1))
+
+    # Инфузия норадреналина (для расчёта дозы)
+    rate = re.search(r"(?:скорость|мл[/\s]ч)\s*([\d.]+)", text, re.I)
+    if rate:
+        pt["norad_ml_h"] = float(rate.group(1))
+    conc = re.search(r"(?:концентрация|конц)\s*([\d.]+)", text, re.I)
+    if conc:
+        pt["norad_mg"] = float(conc.group(1))
+
     return pt
+
+
+# =============================
+# КЛИНИЧЕСКИЕ РАСЧЁТЫ
+# =============================
+
+def calculate_clinical_params(pt: dict) -> dict:
+    """
+    Возвращает расчётные клинические параметры:
+      norad_dose  — доза норадреналина мкг/кг/мин
+      vt_target   — целевой дыхательный объём (ARDSnet), мл
+      vt_range    — диапазон VT 6–8 мл/кг PBW, мл
+      pbw_val     — расчётная ИМТ-масса, кг
+    """
+    result = {}
+
+    # ── Доза норадреналина ──────────────────────────────────────
+    # Формула: dose (мкг/кг/мин) = rate(мл/ч) × conc(мг) × 1000
+    #          ÷ (50мл × 60мин/ч × weight(кг))
+    rate   = pt.get("norad_ml_h")
+    conc   = pt.get("norad_mg")
+    weight = pt.get("weight")
+
+    if rate is not None and conc is not None:
+        w = weight or 80          # если вес не введён — стандарт 80 кг
+        dose = (rate * conc * 1000) / (50 * 60 * w)
+        result["norad_dose"]     = round(dose, 3)
+        result["norad_dose_w"]   = w
+        result["norad_assumed"]  = weight is None   # True → вес взят по умолчанию
+
+    # ── ARDSnet: целевой VT ─────────────────────────────────────
+    height = pt.get("height")
+    if height:
+        ideal = round(50 + 0.91 * (height - 152.4), 1)
+        result["pbw_val"]   = ideal
+        result["vt_target"] = int(ideal * 6)
+        result["vt_range"]  = f"{int(ideal * 6)}–{int(ideal * 8)} мл"
+
+    return result
 
 
 # =============================
@@ -583,8 +638,11 @@ def format_data(pt):
         "bilirubin":  ("Билирубин",    "мкмоль/л"),
         "lactate":    ("Лактат",       "ммоль/л"),
         "uop":        ("Диурез",       "мл/кг/ч"),
+        "weight":     ("Вес",          "кг"),
+        "norad_ml_h": ("Норадр. скор.","мл/ч"),
+        "norad_mg":   ("Норадр. конц.","мг/50мл"),
     }
-    skip = {"sbp", "lactate_history"}
+    skip = {"sbp", "lactate_history", "delta_sofa"}
     lines = []
     for k, v in pt.items():
         if k in skip:
@@ -664,6 +722,28 @@ def build_response(pt):
 
     if qsofa >= 2:
         lines += ["\n🦠 qSOFA ≥ 2 — скрининг сепсиса:", "  • Гемокультуры × 2", "  • Лактат", "  • А/б — в первый час"]
+
+    # ── Клинические расчёты ───────────────────────────────────
+    cp = calculate_clinical_params(pt)
+    cp_lines = []
+    if "norad_dose" in cp:
+        assumed = " (вес 80 кг — по умолчанию)" if cp["norad_assumed"] else f" (вес {cp['norad_dose_w']} кг)"
+        dose    = cp["norad_dose"]
+        if dose < 0.1:
+            tier = "низкая доза"
+        elif dose < 0.25:
+            tier = "средняя доза"
+        elif dose < 0.5:
+            tier = "высокая доза"
+        else:
+            tier = "⚠️ очень высокая доза"
+        cp_lines.append(f"  💉 Норадреналин: {dose} мкг/кг/мин — {tier}{assumed}")
+    if "vt_range" in cp:
+        cp_lines.append(
+            f"  🫁 VT цель (ARDSnet): {cp['vt_range']}  |  PBW {cp['pbw_val']} кг"
+        )
+    if cp_lines:
+        lines += ["\n🔢 Клинические расчёты:"] + cp_lines
 
     lines += ["\n📋 Данные:", format_data(pt)]
     lines.append("\n* байесовская оценка: APACHE II prior + SOFA / лактат / MAP / ΔSOFA")
@@ -1066,10 +1146,13 @@ def build_export(pt):
         "bilirubin":  ("Билирубин",    "мкмоль/л"),
         "lactate":    ("Лактат",       "ммоль/л"),
         "uop":        ("Диурез",       "мл/кг/ч"),
+        "weight":     ("Вес",          "кг"),
+        "norad_ml_h": ("Норадр. скор.","мл/ч"),
+        "norad_mg":   ("Норадр. конц.","мг/50мл"),
     }
-    skip = {"sbp", "lactate_history"}
+    skip = {"sbp", "lactate_history", "delta_sofa"}
 
-    vitals_keys = {"age", "height", "sbp", "map", "hr", "rr", "gcs", "temp", "spo2", "uop"}
+    vitals_keys = {"age", "height", "weight", "sbp", "map", "hr", "rr", "gcs", "temp", "spo2", "uop"}
     abg_keys = {"pao2", "fio2", "paco2", "hco3", "ph"}
     lab_keys = {"sodium", "potassium", "wbc", "plt", "creatinine", "bilirubin", "lactate"}
 
