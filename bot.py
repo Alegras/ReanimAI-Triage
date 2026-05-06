@@ -296,12 +296,42 @@ def triage_level(pt, apache, sofa):
 
 
 # =============================
-# Смертность (логистическая регрессия)
+# Смертность (байесовская модель)
 # =============================
-def mortality(apache):
-    p30 = round(1 / (1 + math.exp(-(-3.5 + 0.146 * apache))) * 100)
-    p24 = round(p30 * 0.45)
-    return min(p24, 99), min(p30, 99)
+def bayesian_mortality(pt, apache, sofa, delta_sofa=None):
+    logit = -3.5 + 0.15 * apache
+    prior = 1 / (1 + math.exp(-logit))
+
+    lr = 1.0
+
+    if sofa >= 8:
+        lr *= 2.5
+    elif sofa >= 4:
+        lr *= 1.5
+
+    if pt.get("lactate", 0) >= 4:
+        lr *= 2.0
+    elif pt.get("lactate", 0) >= 2:
+        lr *= 1.3
+
+    if pt.get("map", 100) < 65:
+        lr *= 1.8
+
+    if delta_sofa is not None:
+        if delta_sofa > 2:
+            lr *= 2.2
+        elif delta_sofa > 0:
+            lr *= 1.3
+        elif delta_sofa < 0:
+            lr *= 0.7
+
+    odds = prior / (1 - prior)
+    post_odds = odds * lr
+    posterior = post_odds / (1 + post_odds)
+
+    p30 = min(99, round(posterior * 100))
+    p24 = min(99, round(p30 * 0.45))
+    return p24, p30
 
 
 # =============================
@@ -381,7 +411,8 @@ def build_response(pt):
     sofa = sofa_score(pt)
     qsofa = qsofa_score(pt)
     level = triage_level(pt, apache, sofa)
-    r24, r30 = mortality(apache)
+    delta_sofa = pt.get("delta_sofa")
+    r24, r30 = bayesian_mortality(pt, apache, sofa, delta_sofa)
     sep = is_sepsis(pt, sofa)
     shock = shock_type(pt)
     lc = lactate_clearance(pt)
@@ -395,11 +426,16 @@ def build_response(pt):
         else f"🟢 qSOFA: {qsofa}/3"
     )
 
+    sofa_line = f"📊 APACHE II: {apache}  |  SOFA: {sofa}"
+    if delta_sofa is not None:
+        arrow = "↑" if delta_sofa > 0 else ("↓" if delta_sofa < 0 else "→")
+        sofa_line += f"  ({arrow}{abs(delta_sofa):+d})"
+
     lines = [
         level,
-        f"📊 APACHE II: {apache}  |  SOFA: {sofa}",
+        sofa_line,
         qsofa_line,
-        f"⚠️ Риск: {r24}% (24ч)  |  {r30}% (30сут)",
+        f"⚠️ Риск*: {r24}% (24ч)  |  {r30}% (30сут)",
         f"🧠 Sepsis-3: {'ДА' if sep else 'нет'}",
     ]
 
@@ -412,6 +448,8 @@ def build_response(pt):
     if lc is not None:
         trend = "↓" if lc > 0 else "↑"
         lines.append(f"📉 Лактат-клиренс: {lc}% {trend}")
+    if delta_sofa is not None:
+        lines.append(f"📈 ΔSOFA: {delta_sofa:+d} — {'ухудшение' if delta_sofa > 0 else 'улучшение' if delta_sofa < 0 else 'стабильно'}")
 
     if acts:
         lines.append("\n✅ Решения:")
@@ -422,6 +460,7 @@ def build_response(pt):
         lines += ["\n🦠 qSOFA ≥ 2 — скрининг сепсиса:", "  • Гемокультуры × 2", "  • Лактат", "  • А/б — в первый час"]
 
     lines += ["\n📋 Данные:", format_data(pt)]
+    lines.append("\n* байесовская оценка: APACHE II prior + SOFA / лактат / MAP / ΔSOFA")
     return "\n".join(lines)
 
 
@@ -526,7 +565,8 @@ def build_export(pt):
     sofa = sofa_score(pt)
     qsofa = qsofa_score(pt)
     level = triage_level(pt, apache, sofa)
-    r24, r30 = mortality(apache)
+    delta_sofa = pt.get("delta_sofa")
+    r24, r30 = bayesian_mortality(pt, apache, sofa, delta_sofa)
     sep = is_sepsis(pt, sofa)
     shock = shock_type(pt)
     lc = lactate_clearance(pt)
@@ -595,6 +635,8 @@ def build_export(pt):
         lines.append(f"A-a град.: {aa}")
     if lc is not None:
         lines.append(f"Лактат-кл: {lc}%")
+    if delta_sofa is not None:
+        lines.append(f"ΔSOFA:     {delta_sofa:+d}")
 
     lines += [
         "",
@@ -683,14 +725,19 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt = get_pt(ctx)
+    prev_sofa = sofa_score(pt) if len([k for k in pt if k not in ("lactate_history", "delta_sofa")]) > 0 else None
     parse(update.message.text, pt)
 
-    if len([k for k in pt if k != "lactate_history"]) == 0:
+    if len([k for k in pt if k not in ("lactate_history", "delta_sofa")]) == 0:
         await update.message.reply_text(
             "Не удалось распознать данные.\n"
             "Отправь /start чтобы увидеть список параметров."
         )
         return
+
+    new_sofa = sofa_score(pt)
+    if prev_sofa is not None:
+        pt["delta_sofa"] = new_sofa - prev_sofa
 
     await update.message.reply_text(build_response(pt), reply_markup=main_keyboard())
 
