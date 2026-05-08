@@ -456,6 +456,109 @@ def calculate_clinical_params(pt: dict) -> dict:
 
 
 # =============================
+# КАЛЬКУЛЯТОР ТИТРОВАНИЯ
+# =============================
+
+# Рекомендуемый интервал между шагами (мин) и шаг (% от диапазона)
+_TITRATE_CONFIG = {
+    "норадреналин": {"interval_min": 5,  "n_steps": 6},
+    "адреналин":    {"interval_min": 5,  "n_steps": 6},
+    "мезатон":      {"interval_min": 5,  "n_steps": 5},
+    "допамин":      {"interval_min": 10, "n_steps": 5},
+    "добутамин":    {"interval_min": 10, "n_steps": 5},
+    "вазопрессин":  {"interval_min": 5,  "n_steps": 4},
+}
+_TITRATE_DEFAULT = {"interval_min": 10, "n_steps": 5}
+
+
+def calculate_titration(drug: str, dose_start: float, dose_end: float,
+                        conc_mg: float, weight: float) -> str:
+    """
+    Строит ASCII-таблицу шагов титрования.
+    Возвращает готовый текст для Telegram (моноширинный блок).
+    """
+    cfg      = _TITRATE_CONFIG.get(drug, _TITRATE_DEFAULT)
+    n_steps  = cfg["n_steps"]
+    interval = cfg["interval_min"]
+
+    is_vaso  = (drug == "вазопрессин")
+    unit     = "ед/мин" if is_vaso else "мкг/кг/мин"
+
+    # Генерируем промежуточные дозы (включая старт и финиш)
+    step_size = (dose_end - dose_start) / n_steps
+    doses = [round(dose_start + i * step_size, 4) for i in range(n_steps + 1)]
+
+    def dose_to_rate(d):
+        if is_vaso:
+            return round((d * 50 * 60) / conc_mg, 1)
+        return round((d * weight * 50 * 60) / (conc_mg * 1000), 1)
+
+    direction = "↑" if dose_end > dose_start else "↓"
+    header = (
+        f"🎯 ТИТРОВАНИЕ — {drug.capitalize()} {direction}\n"
+        f"Вес: {weight} кг  |  Конц: {conc_mg} мг/50мл\n"
+        f"{'─'*36}\n"
+        f"{'Шаг':<4} {'Доза':>10}  {'мл/ч':>6}  Время\n"
+        f"{'─'*36}"
+    )
+
+    rows = []
+    for i, d in enumerate(doses):
+        rate    = dose_to_rate(d)
+        time_lbl = "старт" if i == 0 else f"+{i * interval:02d} мин"
+        goal_lbl = " ✓" if i == len(doses) - 1 else ""
+        rows.append(
+            f"{i:<4} {d:>8.3f}     {rate:>5.1f}  {time_lbl}{goal_lbl}"
+        )
+
+    footer = (
+        f"{'─'*36}\n"
+        f"Шаг ≈ {abs(step_size):.3f} {unit}  |  {interval} мин/шаг\n"
+        f"Общее время: {n_steps * interval} мин"
+    )
+
+    return f"```\n{header}\n" + "\n".join(rows) + f"\n{footer}\n```"
+
+
+def _parse_titrate_args(text: str) -> dict | None:
+    """
+    Парсит аргументы из строки вида:
+      «норадреналин текущая 0.1 цель 0.3 конц 8 вес 75»
+    Возвращает dict или None если данных недостаточно.
+    """
+    _VASOPRESS_PAT_LOCAL = [
+        (r"норадреналин|норэпинефрин", "норадреналин"),
+        (r"адреналин|эпинефрин",       "адреналин"),
+        (r"допамин|дофамин",           "допамин"),
+        (r"добутамин",                 "добутамин"),
+        (r"мезатон|фенилефрин",        "мезатон"),
+        (r"вазопрессин",               "вазопрессин"),
+    ]
+    drug = None
+    for pat, name in _VASOPRESS_PAT_LOCAL:
+        if re.search(pat, text, re.I):
+            drug = name
+            break
+
+    start_m = re.search(r"(?:текущ\w*|от|from|start)\s*([\d.]+)", text, re.I)
+    end_m   = re.search(r"(?:цел\w*|до|to|target|end)\s*([\d.]+)", text, re.I)
+    conc_m  = re.search(r"(?:концентрация|конц|conc)\s*([\d.]+)", text, re.I)
+    weight_m= re.search(r"(?:вес|weight)\s*(\d+)", text, re.I)
+
+    if not all([drug, start_m, end_m, conc_m]):
+        return None
+
+    return {
+        "drug":       drug,
+        "dose_start": float(start_m.group(1)),
+        "dose_end":   float(end_m.group(1)),
+        "conc_mg":    float(conc_m.group(1)),
+        "weight":     int(weight_m.group(1)) if weight_m else 80,
+        "assumed_w":  weight_m is None,
+    }
+
+
+# =============================
 # РАСЧЁТЫ
 # =============================
 
@@ -1435,7 +1538,8 @@ def main_keyboard():
          InlineKeyboardButton("💉 Вазопрессоры",     callback_data="press")],
         [InlineKeyboardButton("🧪 ABG",               callback_data="abg"),
          InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
-        [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help")],
+        [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help"),
+         InlineKeyboardButton("📈 Титрование",        callback_data="titrate_help")],
     ])
 
 
@@ -1556,6 +1660,62 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"```\n{build_export(pt)}\n```",
         parse_mode="Markdown"
     )
+
+
+async def cmd_titrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /titrate [норадреналин текущая 0.1 цель 0.3 конц 8 вес 75]
+    Или без аргументов — показывает справку.
+    """
+    raw  = update.message.text or ""
+    # Убираем саму команду
+    args = re.sub(r"^/titrate\S*\s*", "", raw, flags=re.I).strip()
+
+    # Если аргументы не переданы — пробуем собрать из состояния пациента
+    if not args:
+        pt = get_pt(ctx)
+        if pt.get("vasopressors") or pt.get("target_doses"):
+            # Показываем интерактивные кнопки по известным препаратам
+            known = {v["drug"] for v in (pt.get("vasopressors") or [])
+                     if v.get("rate") and v.get("conc_mg")}
+            if known:
+                btns = [[InlineKeyboardButton(
+                    f"🎯 Титрование {d}", callback_data=f"titrate:{d}"
+                )] for d in known]
+                await update.message.reply_text(
+                    "Выбери препарат для расчёта титрования:",
+                    reply_markup=InlineKeyboardMarkup(btns)
+                )
+                return
+        await update.message.reply_text(
+            "🎯 КАЛЬКУЛЯТОР ТИТРОВАНИЯ\n\n"
+            "Введи команду с параметрами:\n\n"
+            "/titrate норадреналин текущая 0.1 цель 0.3 конц 8 вес 75\n"
+            "/titrate допамин текущая 3 цель 10 конц 200 вес 80\n"
+            "/titrate адреналин текущая 0.05 цель 0.2 конц 2\n\n"
+            "Ключевые слова:\n"
+            "  текущая N  — стартовая доза\n"
+            "  цель N     — целевая доза\n"
+            "  конц N     — мг препарата в 50 мл шприце\n"
+            "  вес N      — вес пациента (по умолчанию 80 кг)\n\n"
+            "Работает для всех 6 вазопрессоров."
+        )
+        return
+
+    params = _parse_titrate_args(args)
+    if not params:
+        await update.message.reply_text(
+            "Не удалось разобрать параметры.\n"
+            "Пример: /titrate норадреналин текущая 0.1 цель 0.3 конц 8 вес 75"
+        )
+        return
+
+    note = " (вес по умолчанию 80 кг)" if params["assumed_w"] else ""
+    table = calculate_titration(
+        params["drug"], params["dose_start"], params["dose_end"],
+        params["conc_mg"], params["weight"]
+    )
+    await update.message.reply_text(table + note, parse_mode="Markdown")
 
 
 async def cmd_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1729,6 +1889,57 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "lac":
         await q.message.reply_text(LAC_TEXT)
 
+    elif q.data == "titrate_help":
+        pt = get_pt(ctx)
+        known = [v for v in (pt.get("vasopressors") or [])
+                 if v.get("rate") and v.get("conc_mg")]
+        if known:
+            btns = [[InlineKeyboardButton(
+                f"🎯 {v['drug'].capitalize()}  скорость {v['rate']} мл/ч  конц {v['conc_mg']} мг",
+                callback_data=f"titrate:{v['drug']}"
+            )] for v in known]
+            await q.message.reply_text(
+                "Выбери препарат — бот рассчитает шаги титрования от текущей дозы:",
+                reply_markup=InlineKeyboardMarkup(btns)
+            )
+        else:
+            await q.message.reply_text(
+                "📈 КАЛЬКУЛЯТОР ТИТРОВАНИЯ\n\n"
+                "Используй команду:\n"
+                "/titrate норадреналин текущая 0.1 цель 0.3 конц 8 вес 75\n\n"
+                "Или сначала введи данные о вазопрессоре:\n"
+                "  норадреналин скорость 6 конц 8 вес 75\n"
+                "— тогда кнопка предложит препараты автоматически."
+            )
+
+    elif q.data.startswith("titrate:"):
+        drug = q.data.split(":", 1)[1]
+        vasos = pt.get("vasopressors") or []
+        entry = next((v for v in vasos if v["drug"] == drug), None)
+        if not entry or not entry.get("rate") or not entry.get("conc_mg"):
+            await q.message.reply_text(
+                f"Нет данных о скорости/концентрации {drug}.\n"
+                f"Введи: {drug} скорость N конц N"
+            )
+            return
+        w = pt.get("weight") or 80
+        # Текущая доза из скорости (прямой расчёт)
+        is_vaso = (drug == "вазопрессин")
+        if is_vaso:
+            cur_dose = round((entry["rate"] * entry["conc_mg"]) / (50 * 60), 4)
+        else:
+            cur_dose = round(
+                (entry["rate"] * entry["conc_mg"] * 1000) / (50 * 60 * w), 3
+            )
+        # Целевая доза из CONFIG или +50% от текущей
+        td_entry = next(
+            (d for d in (pt.get("target_doses") or []) if d["drug"] == drug), None
+        )
+        target = (td_entry or {}).get("target_dose") or round(cur_dose * 1.5, 3)
+        table = calculate_titration(drug, cur_dose, target, entry["conc_mg"], w)
+        assumed = "" if pt.get("weight") else " (вес 80 кг — по умолчанию)"
+        await q.message.reply_text(table + assumed, parse_mode="Markdown")
+
     elif q.data == "rate_help":
         cp = calculate_clinical_params(pt)
         # Если есть данные — показываем готовые обратные расчёты
@@ -1777,6 +1988,7 @@ def main():
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("export",  cmd_export))
     app.add_handler(CommandHandler("missing", cmd_missing))
+    app.add_handler(CommandHandler("titrate", cmd_titrate))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
