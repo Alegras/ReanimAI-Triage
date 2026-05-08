@@ -1540,7 +1540,8 @@ def main_keyboard():
          InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
         [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help"),
          InlineKeyboardButton("📈 Титрование",        callback_data="titrate_help")],
-        [InlineKeyboardButton("🦠 Sepsis Bundle",     callback_data="checklist_open")],
+        [InlineKeyboardButton("🦠 Sepsis Bundle",     callback_data="checklist_open"),
+         InlineKeyboardButton("📋 Пересменка",        callback_data="shift_report")],
     ])
 
 
@@ -1724,6 +1725,172 @@ def _checklist_display(cl: dict) -> tuple[str, InlineKeyboardMarkup]:
     ])
 
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+# =============================
+# ОТЧЁТ НА ПЕРЕСМЕНКУ
+# =============================
+
+def build_shift_report(pt: dict, user_data: dict) -> str:
+    """
+    Собирает полный отчёт на пересменку из состояния пациента.
+    """
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    lines   = [f"📋 ПЕРЕСМЕНКА — {now_str}", "═" * 36]
+
+    # ── Пациент ────────────────────────────────
+    patient_parts = []
+    if "age"    in pt: patient_parts.append(f"{pt['age']} лет")
+    if "weight" in pt: patient_parts.append(f"{pt['weight']} кг")
+    if "height" in pt: patient_parts.append(f"{pt['height']} см")
+    lines.append("👤 ПАЦИЕНТ")
+    lines.append("  " + ("  |  ".join(patient_parts) if patient_parts else "данные не введены"))
+
+    # ── Скоры ──────────────────────────────────
+    apache = apache_score(pt)
+    sofa   = sofa_score(pt)
+    qsofa  = qsofa_score(pt)
+    delta  = pt.get("delta_sofa")
+    p24, p30 = bayesian_mortality(pt, apache, sofa, delta)
+    triage = triage_level(pt, apache, sofa)
+
+    lines.append("")
+    lines.append("📊 СКОРЫ")
+    delta_str = f"  (ΔSOFA {'+' if delta >= 0 else ''}{delta})" if delta is not None else ""
+    lines.append(f"  SOFA:      {sofa} б{delta_str}")
+    lines.append(f"  APACHE II: {apache} б")
+    lines.append(f"  qSOFA:     {qsofa} б")
+    lines.append(f"  Триаж:     {triage}")
+    lines.append(f"  Летальность: 24ч {p24}%  |  30д {p30}%")
+
+    # ── Витальные ──────────────────────────────
+    vitals = []
+    if "map"  in pt:
+        flag = " ⚠️" if pt["map"] < 65 else ""
+        vitals.append(f"MAP {pt['map']}{flag}")
+    if "hr"   in pt: vitals.append(f"ЧСС {pt['hr']}")
+    if "rr"   in pt:
+        flag = " ⚠️" if pt["rr"] >= 22 else ""
+        vitals.append(f"ЧД {pt['rr']}{flag}")
+    if "spo2" in pt:
+        flag = " ⚠️" if pt["spo2"] < 94 else ""
+        vitals.append(f"SpO₂ {pt['spo2']}%{flag}")
+    if "temp" in pt: vitals.append(f"T {pt['temp']}°C")
+    if "gcs"  in pt:
+        flag = " ⚠️" if pt["gcs"] < 13 else ""
+        vitals.append(f"GCS {pt['gcs']}{flag}")
+    if "sbp"  in pt: vitals.append(f"АДс {pt['sbp']}")
+
+    if vitals:
+        lines.append("")
+        lines.append("🫀 ВИТАЛЬНЫЕ")
+        lines.append("  " + "  |  ".join(vitals))
+
+    # ── Вазопрессоры ───────────────────────────
+    vasos = pt.get("vasopressors") or []
+    if vasos:
+        lines.append("")
+        lines.append("💉 ВАЗОПРЕССОРЫ")
+        w = pt.get("weight") or 80
+        for v in vasos:
+            drug = v["drug"].capitalize()
+            rate = v.get("rate")
+            conc = v.get("conc_mg")
+            if rate and conc:
+                is_vaso = v["drug"] == "вазопрессин"
+                if is_vaso:
+                    dose = round((rate * conc) / (50 * 60), 4)
+                    unit = "ед/мин"
+                else:
+                    dose = round((rate * conc * 1000) / (50 * 60 * w), 3)
+                    unit = "мкг/кг/мин"
+                conc_str = f"конц {conc} мг/50мл"
+                lines.append(f"  {drug}: {dose} {unit} → {rate} мл/ч  ({conc_str})")
+            elif rate:
+                lines.append(f"  {drug}: {rate} мл/ч")
+            else:
+                lines.append(f"  {drug}: (нет данных о скорости)")
+
+    # ── Лактат ─────────────────────────────────
+    lac = pt.get("lactate")
+    lac_hist = pt.get("lactate_history") or []
+    if lac is not None or lac_hist:
+        lines.append("")
+        lines.append("🧪 ЛАКТАТ")
+        if lac is not None:
+            flag = " 🔴" if lac >= 4 else (" 🟡" if lac >= 2 else " 🟢")
+            lines.append(f"  Текущий: {lac} ммоль/л{flag}")
+        if len(lac_hist) > 1:
+            trend = " → ".join(str(x) for x in lac_hist[-5:])
+            lines.append(f"  Тренд:   {trend}")
+
+    # ── Газы / ABG ─────────────────────────────
+    abg_parts = []
+    pf = pf_ratio(pt)
+    if pf  is not None: abg_parts.append(f"P/F {int(pf)}")
+    if "ph"  in pt: abg_parts.append(f"pH {pt['ph']}")
+    if "pco2" in pt: abg_parts.append(f"pCO₂ {pt['pco2']}")
+    if "hco3" in pt: abg_parts.append(f"HCO₃ {pt['hco3']}")
+    if "pao2" in pt: abg_parts.append(f"PaO₂ {pt['pao2']}")
+    if "fio2" in pt: abg_parts.append(f"FiO₂ {pt['fio2']}")
+    if abg_parts:
+        lines.append("")
+        lines.append("🫁 ГАЗЫ / ABG")
+        lines.append("  " + "  |  ".join(abg_parts))
+
+    # ── Sepsis Bundle ───────────────────────────
+    cl = user_data.get("checklist")
+    if cl:
+        started  = cl["started_at"]
+        elapsed  = int((datetime.now(timezone.utc).timestamp() - started) / 60)
+        done_ids = [iid for iid, v in cl["items"].items() if v["done"]]
+        skip_ids = [iid for iid, v in cl["items"].items() if not v["done"]]
+        total    = len(CHECKLIST_ITEMS)
+        done_cnt = len(done_ids)
+        start_str = datetime.fromtimestamp(started).strftime("%H:%M")
+
+        lines.append("")
+        lines.append("🦠 SEPSIS BUNDLE")
+        lines.append(f"  Начат: {start_str}  |  Прошло: {elapsed} мин")
+
+        label_map = dict(CHECKLIST_ITEMS)
+        if done_ids:
+            done_labels = ", ".join(
+                label_map[i].split(" ", 1)[1] for i in done_ids if i in label_map
+            )
+            lines.append(f"  ✅ {done_labels}")
+        if skip_ids:
+            skip_labels = ", ".join(
+                label_map[i].split(" ", 1)[1] for i in skip_ids if i in label_map
+            )
+            lines.append(f"  ⬜ {skip_labels}")
+        lines.append(f"  Выполнено: {done_cnt}/{total}")
+
+    # ── Незаполненные поля SOFA ─────────────────
+    skipped  = user_data.get("skipped_fields", set())
+    missing  = missing_sofa_fields(pt, skipped)
+    if missing:
+        label_map_sofa = {
+            "map":        "MAP",
+            "gcs":        "GCS",
+            "creatinine": "Креатинин",
+            "bilirubin":  "Билирубин",
+            "plt":        "Тромбоциты",
+            "pao2":       "PaO₂",
+            "fio2":       "FiO₂",
+        }
+        names = ", ".join(label_map_sofa.get(f, f) for f in missing)
+        lines.append("")
+        lines.append(f"⚠️ СОFA не заполнен: {names}")
+
+    lines += ["═" * 36, f"Сформирован: {now_str}"]
+    return "\n".join(lines)
+
+
+async def cmd_shift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt     = get_pt(ctx)
+    report = build_shift_report(pt, ctx.user_data)
+    await update.message.reply_text(report)
 
 
 async def cmd_checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1973,6 +2140,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "lac":
         await q.message.reply_text(LAC_TEXT)
 
+    elif q.data == "shift_report":
+        report = build_shift_report(pt, ctx.user_data)
+        await q.message.reply_text(report)
+
     elif q.data == "checklist_open":
         if "checklist" not in ctx.user_data:
             ctx.user_data["checklist"] = {
@@ -2111,6 +2282,7 @@ def main():
     app.add_handler(CommandHandler("missing",   cmd_missing))
     app.add_handler(CommandHandler("titrate",   cmd_titrate))
     app.add_handler(CommandHandler("checklist", cmd_checklist))
+    app.add_handler(CommandHandler("shift",     cmd_shift))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
