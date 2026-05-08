@@ -200,7 +200,53 @@ def parse(text, pt):
     if w:
         pt["weight"] = int(w.group(1))
 
-    # Инфузия норадреналина (для расчёта дозы)
+    # ── Вазопрессоры / инотропы ───────────────────────────────
+    # Словарь: паттерн → каноническое имя
+    _VASOPRESS_PAT = [
+        (r"норадреналин|норэпинефрин|norepinephrine",   "норадреналин"),
+        (r"адреналин|эпинефрин|adrenaline|epinephrine", "адреналин"),
+        (r"допамин|дофамин|dopamine",                   "допамин"),
+        (r"добутамин|dobutamine",                       "добутамин"),
+        (r"мезатон|фенилефрин|phenylephrine",           "мезатон"),
+        (r"вазопрессин|vasopressin",                    "вазопрессин"),
+    ]
+    # Разбиваем текст на «предложения» по разделителям
+    chunks = re.split(r"[,;\n]", text)
+    if "vasopressors" not in pt:
+        pt["vasopressors"] = []
+
+    for chunk in chunks:
+        detected = None
+        for pat, name in _VASOPRESS_PAT:
+            if re.search(pat, chunk, re.I):
+                detected = name
+                break
+        if not detected:
+            continue
+        rate_m = re.search(r"(?:скорость|мл[/\s]?ч|rate)\s*([\d.]+)", chunk, re.I)
+        conc_m = re.search(r"(?:концентрация|конц|conc)\s*([\d.]+)", chunk, re.I)
+        if rate_m or conc_m:
+            # обновляем запись с тем же препаратом или добавляем новую
+            existing = next((v for v in pt["vasopressors"] if v["drug"] == detected), None)
+            if existing is None:
+                existing = {"drug": detected, "rate": None, "conc_mg": None}
+                pt["vasopressors"].append(existing)
+            if rate_m:
+                existing["rate"] = float(rate_m.group(1))
+            if conc_m:
+                existing["conc_mg"] = float(conc_m.group(1))
+
+    # Обратная совместимость: старые поля norad_ml_h / norad_mg
+    if pt.get("norad_ml_h") or pt.get("norad_mg"):
+        existing = next((v for v in pt["vasopressors"] if v["drug"] == "норадреналин"), None)
+        if existing is None:
+            pt["vasopressors"].append({
+                "drug": "норадреналин",
+                "rate": pt.get("norad_ml_h"),
+                "conc_mg": pt.get("norad_mg"),
+            })
+
+    # Устаревшие поля — тоже парсим напрямую как раньше (если без имени препарата)
     rate = re.search(r"(?:скорость|мл[/\s]ч)\s*([\d.]+)", text, re.I)
     if rate:
         pt["norad_ml_h"] = float(rate.group(1))
@@ -215,37 +261,119 @@ def parse(text, pt):
 # КЛИНИЧЕСКИЕ РАСЧЁТЫ
 # =============================
 
+# Диапазоны доз (мкг/кг/мин, кроме вазопрессина — ед/мин)
+_DOSE_TIERS = {
+    "норадреналин": [
+        (0.00, 0.10,  "низкая"),
+        (0.10, 0.25,  "средняя"),
+        (0.25, 0.50,  "высокая"),
+        (0.50, 9999,  "⚠️ очень высокая"),
+    ],
+    "адреналин": [
+        (0.00, 0.05,  "низкая"),
+        (0.05, 0.20,  "средняя"),
+        (0.20, 0.50,  "высокая"),
+        (0.50, 9999,  "⚠️ очень высокая"),
+    ],
+    "допамин": [
+        (0.00,  3.0,  "почечная / ↑ диурез"),
+        (3.00, 10.0,  "кардиотропная (↑ СВ)"),
+        (10.0, 20.0,  "вазопрессорная"),
+        (20.0, 9999,  "⚠️ очень высокая"),
+    ],
+    "добутамин": [
+        (0.00,  5.0,  "низкая"),
+        (5.00, 10.0,  "средняя"),
+        (10.0, 20.0,  "высокая"),
+        (20.0, 9999,  "⚠️ очень высокая"),
+    ],
+    "мезатон": [
+        (0.00,  0.5,  "низкая"),
+        (0.50,  2.0,  "средняя"),
+        (2.00, 9999,  "⚠️ высокая"),
+    ],
+    "вазопрессин": [           # ед/мин
+        (0.00, 0.01,  "низкая"),
+        (0.01, 0.03,  "стандартная (0.01–0.03 ед/мин)"),
+        (0.03, 0.04,  "высокая"),
+        (0.04, 9999,  "⚠️ выше рекомендованной"),
+    ],
+}
+
+
+def _dose_tier(drug: str, dose: float) -> str:
+    for lo, hi, label in _DOSE_TIERS.get(drug, []):
+        if lo <= dose < hi:
+            return label
+    return ""
+
+
+def _calc_vasopress_dose(entry: dict, weight: float) -> dict | None:
+    """
+    Рассчитывает дозу одного вазопрессора.
+    Возвращает dict с полями drug, dose, unit, tier или None если данных нет.
+    """
+    drug     = entry.get("drug", "")
+    rate     = entry.get("rate")
+    conc_mg  = entry.get("conc_mg")
+    if rate is None or conc_mg is None:
+        return None
+
+    if drug == "вазопрессин":
+        # Стандарт: N ед в 50 мл, доза в ед/мин
+        dose = round((rate * conc_mg) / (50 * 60), 4)
+        unit = "ед/мин"
+    else:
+        # мкг/кг/мин для всех катехоламинов
+        dose = round((rate * conc_mg * 1000) / (50 * 60 * weight), 3)
+        unit = "мкг/кг/мин"
+
+    return {
+        "drug": drug,
+        "dose": dose,
+        "unit": unit,
+        "tier": _dose_tier(drug, dose),
+    }
+
+
 def calculate_clinical_params(pt: dict) -> dict:
     """
     Возвращает расчётные клинические параметры:
-      norad_dose  — доза норадреналина мкг/кг/мин
-      vt_target   — целевой дыхательный объём (ARDSnet), мл
-      vt_range    — диапазон VT 6–8 мл/кг PBW, мл
-      pbw_val     — расчётная ИМТ-масса, кг
+      vasopressor_results — список рассчитанных доз вазопрессоров
+      weight_used / weight_assumed — какой вес использовался
+      vt_range / pbw_val  — ARDSnet VT
     """
     result = {}
-
-    # ── Доза норадреналина ──────────────────────────────────────
-    # Формула: dose (мкг/кг/мин) = rate(мл/ч) × conc(мг) × 1000
-    #          ÷ (50мл × 60мин/ч × weight(кг))
-    rate   = pt.get("norad_ml_h")
-    conc   = pt.get("norad_mg")
     weight = pt.get("weight")
+    w      = weight or 80
+    result["weight_used"]    = w
+    result["weight_assumed"] = weight is None
 
-    if rate is not None and conc is not None:
-        w = weight or 80          # если вес не введён — стандарт 80 кг
-        dose = (rate * conc * 1000) / (50 * 60 * w)
-        result["norad_dose"]     = round(dose, 3)
-        result["norad_dose_w"]   = w
-        result["norad_assumed"]  = weight is None   # True → вес взят по умолчанию
+    # ── Вазопрессоры ────────────────────────────────────────────
+    vasolist = list(pt.get("vasopressors") or [])
+
+    # Обратная совместимость: старые поля norad_ml_h / norad_mg
+    old_rate = pt.get("norad_ml_h")
+    old_conc = pt.get("norad_mg")
+    if old_rate is not None and old_conc is not None:
+        if not any(v["drug"] == "норадреналин" and v.get("rate") for v in vasolist):
+            vasolist.append({"drug": "норадреналин", "rate": old_rate, "conc_mg": old_conc})
+
+    vaso_results = []
+    for entry in vasolist:
+        r = _calc_vasopress_dose(entry, w)
+        if r:
+            vaso_results.append(r)
+
+    if vaso_results:
+        result["vasopressor_results"] = vaso_results
 
     # ── ARDSnet: целевой VT ─────────────────────────────────────
     height = pt.get("height")
     if height:
         ideal = round(50 + 0.91 * (height - 152.4), 1)
-        result["pbw_val"]   = ideal
-        result["vt_target"] = int(ideal * 6)
-        result["vt_range"]  = f"{int(ideal * 6)}–{int(ideal * 8)} мл"
+        result["pbw_val"]  = ideal
+        result["vt_range"] = f"{int(ideal * 6)}–{int(ideal * 8)} мл"
 
     return result
 
@@ -726,22 +854,14 @@ def build_response(pt):
     # ── Клинические расчёты ───────────────────────────────────
     cp = calculate_clinical_params(pt)
     cp_lines = []
-    if "norad_dose" in cp:
-        assumed = " (вес 80 кг — по умолчанию)" if cp["norad_assumed"] else f" (вес {cp['norad_dose_w']} кг)"
-        dose    = cp["norad_dose"]
-        if dose < 0.1:
-            tier = "низкая доза"
-        elif dose < 0.25:
-            tier = "средняя доза"
-        elif dose < 0.5:
-            tier = "высокая доза"
-        else:
-            tier = "⚠️ очень высокая доза"
-        cp_lines.append(f"  💉 Норадреналин: {dose} мкг/кг/мин — {tier}{assumed}")
+    w_note = f" (вес {cp['weight_used']} кг{'*' if cp['weight_assumed'] else ''})"
+    for vr in cp.get("vasopressor_results", []):
+        tier_str = f" — {vr['tier']}" if vr["tier"] else ""
+        cp_lines.append(f"  💉 {vr['drug'].capitalize()}: {vr['dose']} {vr['unit']}{tier_str}{w_note}")
     if "vt_range" in cp:
-        cp_lines.append(
-            f"  🫁 VT цель (ARDSnet): {cp['vt_range']}  |  PBW {cp['pbw_val']} кг"
-        )
+        cp_lines.append(f"  🫁 VT (ARDSnet): {cp['vt_range']}  |  PBW {cp['pbw_val']} кг")
+    if cp.get("weight_assumed") and cp_lines:
+        cp_lines.append("  * вес не введён — использовано 80 кг по умолчанию")
     if cp_lines:
         lines += ["\n🔢 Клинические расчёты:"] + cp_lines
 
