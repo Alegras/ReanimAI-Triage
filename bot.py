@@ -1540,6 +1540,7 @@ def main_keyboard():
          InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
         [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help"),
          InlineKeyboardButton("📈 Титрование",        callback_data="titrate_help")],
+        [InlineKeyboardButton("🦠 Sepsis Bundle",     callback_data="checklist_open")],
     ])
 
 
@@ -1660,6 +1661,89 @@ async def cmd_export(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"```\n{build_export(pt)}\n```",
         parse_mode="Markdown"
     )
+
+
+# =============================
+# SEPSIS BUNDLE CHECKLIST
+# =============================
+from datetime import timezone
+
+CHECKLIST_ITEMS = [
+    ("lactate",    "🧪 Измерить лактат"),
+    ("cultures",   "🧫 Гемокультуры × 2 (до антибиотиков)"),
+    ("abx",        "💊 Антибиотики широкого спектра < 1 ч"),
+    ("fluids",     "💧 Кристаллоиды 30 мл/кг"),
+    ("vasopressors","💉 Вазопрессоры → MAP ≥ 65"),
+    ("repeat_lac", "🔁 Повторный лактат через 2 ч"),
+]
+
+
+def _checklist_display(cl: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Формирует текст и клавиатуру для текущего состояния чеклиста.
+    cl = {"started_at": float, "items": {id: {"done": bool, "done_at": float}}}
+    """
+    started  = cl["started_at"]
+    now      = datetime.now(timezone.utc).timestamp()
+    elapsed  = int((now - started) / 60)
+    start_dt = datetime.fromtimestamp(started).strftime("%H:%M")
+
+    done_count = sum(1 for v in cl["items"].values() if v["done"])
+    total      = len(CHECKLIST_ITEMS)
+    all_done   = done_count == total
+
+    status_icon = "✅" if all_done else ("🟡" if done_count > 0 else "🔴")
+    lines = [
+        f"🦠 SEPSIS BUNDLE {status_icon}",
+        f"⏱ Начат: {start_dt}  |  Прошло: {elapsed} мин",
+        "─" * 34,
+    ]
+
+    buttons = []
+    for item_id, label in CHECKLIST_ITEMS:
+        state = cl["items"].get(item_id, {"done": False})
+        if state["done"]:
+            done_at = state.get("done_at", started)
+            delta   = int((done_at - started) / 60)
+            lines.append(f"  ✅ {label}  (+{delta} мин)")
+        else:
+            lines.append(f"  ⬜ {label}")
+            buttons.append([InlineKeyboardButton(
+                f"✅ {label}", callback_data=f"checklist:{item_id}"
+            )])
+
+    lines += [
+        "─" * 34,
+        f"Выполнено: {done_count}/{total}",
+    ]
+    if all_done:
+        lines.append("🎉 Sepsis bundle выполнен!")
+
+    buttons.append([
+        InlineKeyboardButton("🔄 Начать заново", callback_data="checklist_reset"),
+    ])
+
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def cmd_checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+
+    # Создаём или сбрасываем чеклист
+    if "checklist" not in ctx.user_data or update.message.text.strip().endswith("new"):
+        ctx.user_data["checklist"] = {
+            "started_at": datetime.now(timezone.utc).timestamp(),
+            "items": {item_id: {"done": False} for item_id, _ in CHECKLIST_ITEMS},
+        }
+
+    # Предзаполняем лактат если уже измерен
+    cl = ctx.user_data["checklist"]
+    if pt.get("lactate") is not None and not cl["items"]["lactate"]["done"]:
+        cl["items"]["lactate"]["done"]    = True
+        cl["items"]["lactate"]["done_at"] = cl["started_at"]
+
+    text, kbd = _checklist_display(cl)
+    await update.message.reply_text(text, reply_markup=kbd)
 
 
 async def cmd_titrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1889,6 +1973,43 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif q.data == "lac":
         await q.message.reply_text(LAC_TEXT)
 
+    elif q.data == "checklist_open":
+        if "checklist" not in ctx.user_data:
+            ctx.user_data["checklist"] = {
+                "started_at": datetime.now(timezone.utc).timestamp(),
+                "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
+            }
+            pt = get_pt(ctx)
+            cl = ctx.user_data["checklist"]
+            if pt.get("lactate") is not None and not cl["items"]["lactate"]["done"]:
+                cl["items"]["lactate"]["done"]    = True
+                cl["items"]["lactate"]["done_at"] = cl["started_at"]
+        text, kbd = _checklist_display(ctx.user_data["checklist"])
+        await q.message.reply_text(text, reply_markup=kbd)
+
+    elif q.data == "checklist_reset":
+        ctx.user_data["checklist"] = {
+            "started_at": datetime.now(timezone.utc).timestamp(),
+            "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
+        }
+        text, kbd = _checklist_display(ctx.user_data["checklist"])
+        await q.message.edit_text(text, reply_markup=kbd)
+
+    elif q.data.startswith("checklist:"):
+        item_id = q.data.split(":", 1)[1]
+        if "checklist" not in ctx.user_data:
+            ctx.user_data["checklist"] = {
+                "started_at": datetime.now(timezone.utc).timestamp(),
+                "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
+            }
+        cl = ctx.user_data["checklist"]
+        cl["items"][item_id] = {
+            "done":    True,
+            "done_at": datetime.now(timezone.utc).timestamp(),
+        }
+        text, kbd = _checklist_display(cl)
+        await q.message.edit_text(text, reply_markup=kbd)
+
     elif q.data == "titrate_help":
         pt = get_pt(ctx)
         known = [v for v in (pt.get("vasopressors") or [])
@@ -1987,8 +2108,9 @@ def main():
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("export",  cmd_export))
-    app.add_handler(CommandHandler("missing", cmd_missing))
-    app.add_handler(CommandHandler("titrate", cmd_titrate))
+    app.add_handler(CommandHandler("missing",   cmd_missing))
+    app.add_handler(CommandHandler("titrate",   cmd_titrate))
+    app.add_handler(CommandHandler("checklist", cmd_checklist))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
