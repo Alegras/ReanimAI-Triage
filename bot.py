@@ -236,6 +236,38 @@ def parse(text, pt):
             if conc_m:
                 existing["conc_mg"] = float(conc_m.group(1))
 
+    # ── Обратный расчёт: целевая доза → нужная скорость ────────
+    # Паттерн: «[препарат] доза N [конц N]» или «доза N [препарат] [конц N]»
+    if "target_doses" not in pt:
+        pt["target_doses"] = []
+    for chunk in chunks:
+        target_m = re.search(r"(?:целевая\s*)?доза\s*([\d.]+)", chunk, re.I)
+        if not target_m:
+            continue
+        t_drug = None
+        for pat, name in _VASOPRESS_PAT:
+            if re.search(pat, chunk, re.I):
+                t_drug = name
+                break
+        if not t_drug:
+            # ищем имя препарата в соседних чанках (ввод одной строкой)
+            for pat, name in _VASOPRESS_PAT:
+                if re.search(pat, text, re.I):
+                    t_drug = name
+                    break
+        if not t_drug:
+            continue
+        t_conc_m = re.search(r"(?:концентрация|конц|conc)\s*([\d.]+)", chunk, re.I)
+        existing_td = next(
+            (d for d in pt["target_doses"] if d["drug"] == t_drug), None
+        )
+        if existing_td is None:
+            existing_td = {"drug": t_drug, "target_dose": None, "conc_mg": None}
+            pt["target_doses"].append(existing_td)
+        existing_td["target_dose"] = float(target_m.group(1))
+        if t_conc_m:
+            existing_td["conc_mg"] = float(t_conc_m.group(1))
+
     # Обратная совместимость: старые поля norad_ml_h / norad_mg
     if pt.get("norad_ml_h") or pt.get("norad_mg"):
         existing = next((v for v in pt["vasopressors"] if v["drug"] == "норадреналин"), None)
@@ -336,10 +368,38 @@ def _calc_vasopress_dose(entry: dict, weight: float) -> dict | None:
     }
 
 
+def _calc_target_rate(drug: str, target_dose: float, conc_mg: float,
+                      weight: float) -> dict:
+    """
+    Обратный расчёт: целевая доза → скорость инфузии (мл/ч).
+    drug        — название препарата
+    target_dose — цель мкг/кг/мин (ед/мин для вазопрессина)
+    conc_mg     — мг (или ед для вазопрессина) в 50 мл шприце
+    weight      — вес пациента, кг
+    """
+    if drug == "вазопрессин":
+        # rate = dose(ед/мин) × 50(мл) × 60(мин/ч) / conc(ед)
+        rate = (target_dose * 50 * 60) / conc_mg
+        unit = "ед/мин"
+    else:
+        # rate = dose(мкг/кг/мин) × weight × 50 × 60 / (conc_mg × 1000)
+        rate = (target_dose * weight * 50 * 60) / (conc_mg * 1000)
+        unit = "мкг/кг/мин"
+    return {
+        "drug":        drug,
+        "target_dose": target_dose,
+        "unit":        unit,
+        "conc_mg":     conc_mg,
+        "rate_ml_h":   round(rate, 1),
+        "tier":        _dose_tier(drug, target_dose),
+    }
+
+
 def calculate_clinical_params(pt: dict) -> dict:
     """
     Возвращает расчётные клинические параметры:
       vasopressor_results — список рассчитанных доз вазопрессоров
+      target_rate_results — обратный расчёт (доза → скорость)
       weight_used / weight_assumed — какой вес использовался
       vt_range / pbw_val  — ARDSnet VT
     """
@@ -367,6 +427,23 @@ def calculate_clinical_params(pt: dict) -> dict:
 
     if vaso_results:
         result["vasopressor_results"] = vaso_results
+
+    # ── Обратный расчёт: доза → скорость ───────────────────────
+    rate_results = []
+    for td in pt.get("target_doses") or []:
+        drug   = td.get("drug")
+        t_dose = td.get("target_dose")
+        # приоритет конц из target_doses, иначе из vasopressors
+        conc = td.get("conc_mg")
+        if conc is None:
+            vaso_entry = next(
+                (v for v in (pt.get("vasopressors") or []) if v["drug"] == drug), None
+            )
+            conc = (vaso_entry or {}).get("conc_mg")
+        if drug and t_dose is not None and conc:
+            rate_results.append(_calc_target_rate(drug, t_dose, conc, w))
+    if rate_results:
+        result["target_rate_results"] = rate_results
 
     # ── ARDSnet: целевой VT ─────────────────────────────────────
     height = pt.get("height")
@@ -857,7 +934,15 @@ def build_response(pt):
     w_note = f" (вес {cp['weight_used']} кг{'*' if cp['weight_assumed'] else ''})"
     for vr in cp.get("vasopressor_results", []):
         tier_str = f" — {vr['tier']}" if vr["tier"] else ""
-        cp_lines.append(f"  💉 {vr['drug'].capitalize()}: {vr['dose']} {vr['unit']}{tier_str}{w_note}")
+        cp_lines.append(
+            f"  💉 {vr['drug'].capitalize()}: {vr['dose']} {vr['unit']}{tier_str}{w_note}"
+        )
+    for tr in cp.get("target_rate_results", []):
+        tier_str = f" ({tr['tier']})" if tr["tier"] else ""
+        cp_lines.append(
+            f"  🎯 {tr['drug'].capitalize()} → цель {tr['target_dose']} {tr['unit']}{tier_str}: "
+            f"скорость {tr['rate_ml_h']} мл/ч (конц {tr['conc_mg']} мг/50мл){w_note}"
+        )
     if "vt_range" in cp:
         cp_lines.append(f"  🫁 VT (ARDSnet): {cp['vt_range']}  |  PBW {cp['pbw_val']} кг")
     if cp.get("weight_assumed") and cp_lines:
@@ -1350,6 +1435,7 @@ def main_keyboard():
          InlineKeyboardButton("💉 Вазопрессоры",     callback_data="press")],
         [InlineKeyboardButton("🧪 ABG",               callback_data="abg"),
          InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
+        [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help")],
     ])
 
 
@@ -1642,6 +1728,42 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif q.data == "lac":
         await q.message.reply_text(LAC_TEXT)
+
+    elif q.data == "rate_help":
+        cp = calculate_clinical_params(pt)
+        # Если есть данные — показываем готовые обратные расчёты
+        tr_list = cp.get("target_rate_results", [])
+        if tr_list:
+            lines = ["🎯 РАСЧЁТ СКОРОСТИ ПО ЦЕЛЕВОЙ ДОЗЕ\n"]
+            w_note = f"вес {cp['weight_used']} кг{'*' if cp['weight_assumed'] else ''}"
+            for tr in tr_list:
+                tier_str = f" ({tr['tier']})" if tr["tier"] else ""
+                lines.append(
+                    f"💉 {tr['drug'].capitalize()}: цель {tr['target_dose']} {tr['unit']}{tier_str}\n"
+                    f"   → скорость {tr['rate_ml_h']} мл/ч\n"
+                    f"   (конц {tr['conc_mg']} мг/50мл, {w_note})"
+                )
+            lines.append(
+                "\nДля нового расчёта введи:\n"
+                "  норадреналин доза 0.3 конц 8 вес 75\n"
+                "  допамин доза 8 конц 200"
+            )
+            await q.message.reply_text("\n".join(lines))
+        else:
+            await q.message.reply_text(
+                "🎯 РАСЧЁТ СКОРОСТИ ПО ЦЕЛЕВОЙ ДОЗЕ\n\n"
+                "Формула: скорость (мл/ч) = доза × вес × 50 × 60 / (конц × 1000)\n\n"
+                "Введи в чат:\n"
+                "  норадреналин доза 0.2 конц 8 вес 75\n"
+                "  допамин доза 5 конц 200 вес 80\n"
+                "  адреналин доза 0.1 конц 2\n"
+                "  вазопрессин доза 0.02 конц 20\n\n"
+                "Поддерживаемые препараты:\n"
+                "  норадреналин, адреналин, допамин,\n"
+                "  добутамин, мезатон, вазопрессин\n\n"
+                "💡 Концентрация — мг препарата в 50 мл шприце.\n"
+                "   Если вес не указан — используется 80 кг."
+            )
 
 
 # =============================
