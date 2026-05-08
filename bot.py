@@ -120,12 +120,25 @@ class Patient(BaseModel):
 
 
 # =============================
-# STATE
+# STATE  (multi-patient)
 # =============================
+def _ensure_patients(ctx):
+    if "patients" not in ctx.user_data:
+        ctx.user_data["patients"]       = {1: {"lactate_history": []}}
+        ctx.user_data["current_pt_id"]  = 1
+
+
 def get_pt(ctx):
-    if "pt" not in ctx.user_data:
-        ctx.user_data["pt"] = {"lactate_history": []}
-    return ctx.user_data["pt"]
+    _ensure_patients(ctx)
+    pid = ctx.user_data.get("current_pt_id", 1)
+    if pid not in ctx.user_data["patients"]:
+        ctx.user_data["patients"][pid] = {"lactate_history": []}
+    return ctx.user_data["patients"][pid]
+
+
+def current_pid(ctx) -> int:
+    _ensure_patients(ctx)
+    return ctx.user_data.get("current_pt_id", 1)
 
 
 # =============================
@@ -1525,24 +1538,72 @@ def build_export(pt):
 
 
 # =============================
-# КНОПКИ
+# КНОПКИ  (иерархическое меню)
 # =============================
-def main_keyboard():
+_IKB = InlineKeyboardButton   # сокращение
+
+
+def main_keyboard(ctx=None):
+    if ctx is not None:
+        _ensure_patients(ctx)
+        pid   = ctx.user_data.get("current_pt_id", 1)
+        total = len(ctx.user_data["patients"])
+        pt_label = f"👥 Пациент {pid}/{total}"
+    else:
+        pt_label = "👥 Пациенты"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧾 Дашборд",          callback_data="dash"),
-         InlineKeyboardButton("🧮 Пересчитать",      callback_data="recalc"),
-         InlineKeyboardButton("❌ Сброс",             callback_data="clear")],
-        [InlineKeyboardButton("🦠 Сепсис",           callback_data="sepsis"),
-         InlineKeyboardButton("⚡ Шок",               callback_data="shock")],
-        [InlineKeyboardButton("🫁 ИВЛ / ARDSNet",    callback_data="vent"),
-         InlineKeyboardButton("💉 Вазопрессоры",     callback_data="press")],
-        [InlineKeyboardButton("🧪 ABG",               callback_data="abg"),
-         InlineKeyboardButton("📉 Лактат",            callback_data="lac")],
-        [InlineKeyboardButton("🎯 Скорость по дозе",  callback_data="rate_help"),
-         InlineKeyboardButton("📈 Титрование",        callback_data="titrate_help")],
-        [InlineKeyboardButton("🦠 Sepsis Bundle",     callback_data="checklist_open"),
-         InlineKeyboardButton("📋 Пересменка",        callback_data="shift_report")],
+        [_IKB("📊 Дашборд",     "dash"),
+         _IKB("🔄 Пересчитать", "recalc"),
+         _IKB("❌ Сброс",        "clear")],
+        [_IKB("🩺 Протоколы",   "menu_protocols"),
+         _IKB("💉 Вазопрессоры","menu_vasos"),
+         _IKB("📋 Отчёты",      "menu_reports")],
+        [_IKB(pt_label,          "menu_patients")],
     ])
+
+
+def protocols_keyboard():
+    return InlineKeyboardMarkup([
+        [_IKB("🦠 Сепсис",        "sepsis"),
+         _IKB("⚡ Шок",            "shock")],
+        [_IKB("🫁 ИВЛ / ARDSNet", "vent"),
+         _IKB("🧪 ABG",            "abg")],
+        [_IKB("📉 Лактат",         "lac"),
+         _IKB("🦠 Sepsis Bundle",  "checklist_open")],
+        [_IKB("← Главное меню",    "menu_main")],
+    ])
+
+
+def vasos_keyboard():
+    return InlineKeyboardMarkup([
+        [_IKB("💉 Протокол вазопрессоров", "press")],
+        [_IKB("🎯 Скорость по дозе", "rate_help"),
+         _IKB("📈 Титрование",        "titrate_help")],
+        [_IKB("← Главное меню",       "menu_main")],
+    ])
+
+
+def reports_keyboard():
+    return InlineKeyboardMarkup([
+        [_IKB("📋 Пересменка",  "shift_report"),
+         _IKB("📤 Экспорт CSV", "export_csv")],
+        [_IKB("← Главное меню", "menu_main")],
+    ])
+
+
+def patients_keyboard(ctx):
+    _ensure_patients(ctx)
+    patients = ctx.user_data["patients"]
+    pid      = ctx.user_data.get("current_pt_id", 1)
+    btns = []
+    for p_id in sorted(patients.keys()):
+        mark  = "✓ " if p_id == pid else ""
+        has   = any(k not in ("lactate_history", "delta_sofa") for k in patients[p_id])
+        tag   = "" if has else " (пуст)"
+        btns.append([_IKB(f"{mark}Пациент {p_id}{tag}", f"pt_switch:{p_id}")])
+    btns.append([_IKB("➕ Новый пациент", "pt_new")])
+    btns.append([_IKB("← Главное меню",  "menu_main")])
+    return InlineKeyboardMarkup(btns)
 
 
 # =============================
@@ -1616,7 +1677,7 @@ def skip_keyboard(field: str) -> InlineKeyboardMarkup:
 def _finalize(pt: dict, ctx) -> str:
     """Вычисляем delta_sofa и возвращаем build_response."""
     new_sofa = sofa_score(pt)
-    base = ctx.user_data.pop("_base_sofa", None)
+    base = pt.pop("_base_sofa", None)
     if base is not None:
         pt["delta_sofa"] = new_sofa - base
     return build_response(pt)
@@ -1626,7 +1687,9 @@ def _finalize(pt: dict, ctx) -> str:
 # ОБРАБОТЧИКИ
 # =============================
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data.clear()   # сбрасывает skipped_fields, waiting_for, _base_sofa
+    ctx.user_data.clear()
+    ctx.user_data["patients"]      = {1: {"lactate_history": []}}
+    ctx.user_data["current_pt_id"] = 1
     await update.message.reply_text(
         "ICU CDSS готов. Введи данные пациента.\n\n"
         "Поддерживаемые параметры:\n"
@@ -1731,7 +1794,7 @@ def _checklist_display(cl: dict) -> tuple[str, InlineKeyboardMarkup]:
 # ОТЧЁТ НА ПЕРЕСМЕНКУ
 # =============================
 
-def build_shift_report(pt: dict, user_data: dict) -> str:
+def build_shift_report(pt: dict) -> str:
     """
     Собирает полный отчёт на пересменку из состояния пациента.
     """
@@ -1839,7 +1902,7 @@ def build_shift_report(pt: dict, user_data: dict) -> str:
         lines.append("  " + "  |  ".join(abg_parts))
 
     # ── Sepsis Bundle ───────────────────────────
-    cl = user_data.get("checklist")
+    cl = pt.get("checklist")
     if cl:
         started  = cl["started_at"]
         elapsed  = int((datetime.now(timezone.utc).timestamp() - started) / 60)
@@ -1867,7 +1930,7 @@ def build_shift_report(pt: dict, user_data: dict) -> str:
         lines.append(f"  Выполнено: {done_cnt}/{total}")
 
     # ── Незаполненные поля SOFA ─────────────────
-    skipped  = user_data.get("skipped_fields", set())
+    skipped  = pt.get("skipped_fields", set())
     missing  = missing_sofa_fields(pt, skipped)
     if missing:
         label_map_sofa = {
@@ -1889,7 +1952,7 @@ def build_shift_report(pt: dict, user_data: dict) -> str:
 
 async def cmd_shift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt     = get_pt(ctx)
-    report = build_shift_report(pt, ctx.user_data)
+    report = build_shift_report(pt)
     await update.message.reply_text(report)
 
 
@@ -1897,14 +1960,14 @@ async def cmd_checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt = get_pt(ctx)
 
     # Создаём или сбрасываем чеклист
-    if "checklist" not in ctx.user_data or update.message.text.strip().endswith("new"):
-        ctx.user_data["checklist"] = {
+    if "checklist" not in pt or update.message.text.strip().endswith("new"):
+        pt["checklist"] = {
             "started_at": datetime.now(timezone.utc).timestamp(),
             "items": {item_id: {"done": False} for item_id, _ in CHECKLIST_ITEMS},
         }
 
     # Предзаполняем лактат если уже измерен
-    cl = ctx.user_data["checklist"]
+    cl = pt["checklist"]
     if pt.get("lactate") is not None and not cl["items"]["lactate"]["done"]:
         cl["items"]["lactate"]["done"]    = True
         cl["items"]["lactate"]["done_at"] = cl["started_at"]
@@ -1971,7 +2034,7 @@ async def cmd_titrate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt      = get_pt(ctx)
-    skipped = ctx.user_data.setdefault("skipped_fields", set())
+    skipped = pt.setdefault("skipped_fields", set())
 
     SYSTEM_LABELS = {
         "cv":    "Гемодинамика",
@@ -2017,16 +2080,16 @@ async def cmd_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt      = get_pt(ctx)
     text    = update.message.text.strip()
-    skipped = ctx.user_data.setdefault("skipped_fields", set())
+    skipped = pt.setdefault("skipped_fields", set())
 
     # ── Режим ожидания конкретного поля ──────────────────────────
-    if "waiting_for" in ctx.user_data:
-        field = ctx.user_data.pop("waiting_for")
+    if "waiting_for" in pt:
+        field = pt.pop("waiting_for")
         try:
             val = float(text.replace(",", "."))
             pt[field] = int(val) if field in _INT_FIELDS else val
         except ValueError:
-            ctx.user_data["waiting_for"] = field
+            pt["waiting_for"] = field
             await update.message.reply_text(
                 "Некорректное значение — введи число.",
                 reply_markup=skip_keyboard(field)
@@ -2036,9 +2099,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         # ── Обычный ввод: парсим свободный текст ─────────────────
         has_data = any(k not in ("lactate_history", "delta_sofa") for k in pt)
-        ctx.user_data["_base_sofa"] = sofa_score(pt) if has_data else None
-        ctx.user_data["skipped_fields"] = set()          # новая порция — сброс пропусков
-        skipped = ctx.user_data["skipped_fields"]
+        pt["_base_sofa"]    = sofa_score(pt) if has_data else None
+        pt["skipped_fields"] = set()
+        skipped              = pt["skipped_fields"]
 
         parse(text, pt)
 
@@ -2053,7 +2116,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     missing = missing_sofa_fields(pt, skipped)
     if missing:
         _, field = missing[0]
-        ctx.user_data["waiting_for"] = field
+        pt["waiting_for"] = field
         await update.message.reply_text(
             FIELD_HINTS.get(field, f"❗ Нужен: {FIELD_NAMES.get(field, field)}"),
             reply_markup=skip_keyboard(field)
@@ -2061,7 +2124,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Все данные есть → считаем ─────────────────────────────────
-    await update.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard())
+    await update.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard(ctx))
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2082,13 +2145,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len([k for k in pt if k != "lactate_history"]) == 0:
             await q.message.reply_text("Нет данных. Введи данные пациента.")
         else:
-            await q.message.reply_text(build_response(pt), reply_markup=main_keyboard())
+            await q.message.reply_text(build_response(pt), reply_markup=main_keyboard(ctx))
 
     elif q.data.startswith("enter:"):
         field = q.data.split(":", 1)[1]
-        skipped = ctx.user_data.setdefault("skipped_fields", set())
-        skipped.discard(field)                         # снимаем пропуск, если был
-        ctx.user_data["waiting_for"] = field
+        pt.setdefault("skipped_fields", set()).discard(field)
+        pt["waiting_for"] = field
         name = FIELD_NAMES.get(field, field)
         await q.message.reply_text(
             FIELD_HINTS.get(field, f"Введи {name}:"),
@@ -2097,24 +2159,27 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif q.data.startswith("skip:"):
         field = q.data.split(":", 1)[1]
-        skipped = ctx.user_data.setdefault("skipped_fields", set())
-        skipped.add(field)
-        ctx.user_data.pop("waiting_for", None)
+        pt.setdefault("skipped_fields", set()).add(field)
+        pt.pop("waiting_for", None)
 
-        missing = missing_sofa_fields(pt, skipped)
+        missing = missing_sofa_fields(pt, pt.get("skipped_fields", set()))
         if missing:
             _, next_field = missing[0]
-            ctx.user_data["waiting_for"] = next_field
+            pt["waiting_for"] = next_field
             await q.message.reply_text(
                 FIELD_HINTS.get(next_field, f"❗ Нужен: {FIELD_NAMES.get(next_field, next_field)}"),
                 reply_markup=skip_keyboard(next_field)
             )
         else:
-            await q.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard())
+            await q.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard(ctx))
 
     elif q.data == "clear":
-        ctx.user_data.clear()
-        await q.message.reply_text("Данные пациента сброшены.")
+        pid = current_pid(ctx)
+        ctx.user_data["patients"][pid] = {"lactate_history": []}
+        await q.message.reply_text(
+            f"Данные пациента {pid} сброшены.",
+            reply_markup=main_keyboard(ctx)
+        )
 
     elif q.data == "sepsis":
         await q.message.reply_text(SEPSIS_TEXT)
@@ -2141,44 +2206,84 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(LAC_TEXT)
 
     elif q.data == "shift_report":
-        report = build_shift_report(pt, ctx.user_data)
+        report = build_shift_report(pt)
         await q.message.reply_text(report)
 
+    elif q.data == "export_csv":
+        if len([k for k in pt if k != "lactate_history"]) == 0:
+            await q.message.reply_text("Нет данных для экспорта.")
+        else:
+            await q.message.reply_text(
+                f"```\n{build_export(pt)}\n```", parse_mode="Markdown"
+            )
+
+    elif q.data == "menu_main":
+        await q.message.edit_reply_markup(reply_markup=main_keyboard(ctx))
+
+    elif q.data == "menu_protocols":
+        await q.message.edit_reply_markup(reply_markup=protocols_keyboard())
+
+    elif q.data == "menu_vasos":
+        await q.message.edit_reply_markup(reply_markup=vasos_keyboard())
+
+    elif q.data == "menu_reports":
+        await q.message.edit_reply_markup(reply_markup=reports_keyboard())
+
+    elif q.data == "menu_patients":
+        await q.message.edit_reply_markup(reply_markup=patients_keyboard(ctx))
+
+    elif q.data == "pt_new":
+        _ensure_patients(ctx)
+        new_id = max(ctx.user_data["patients"].keys()) + 1
+        ctx.user_data["patients"][new_id]  = {"lactate_history": []}
+        ctx.user_data["current_pt_id"]     = new_id
+        pt = get_pt(ctx)
+        await q.message.edit_reply_markup(reply_markup=main_keyboard(ctx))
+        await q.message.reply_text(
+            f"Создан Пациент {new_id}. Введи данные."
+        )
+
+    elif q.data.startswith("pt_switch:"):
+        new_id = int(q.data.split(":", 1)[1])
+        _ensure_patients(ctx)
+        if new_id not in ctx.user_data["patients"]:
+            ctx.user_data["patients"][new_id] = {"lactate_history": []}
+        ctx.user_data["current_pt_id"] = new_id
+        await q.message.edit_reply_markup(reply_markup=main_keyboard(ctx))
+        await q.message.reply_text(f"Переключено на Пациент {new_id}.")
+
     elif q.data == "checklist_open":
-        if "checklist" not in ctx.user_data:
-            ctx.user_data["checklist"] = {
+        if "checklist" not in pt:
+            pt["checklist"] = {
                 "started_at": datetime.now(timezone.utc).timestamp(),
                 "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
             }
-            pt = get_pt(ctx)
-            cl = ctx.user_data["checklist"]
-            if pt.get("lactate") is not None and not cl["items"]["lactate"]["done"]:
-                cl["items"]["lactate"]["done"]    = True
-                cl["items"]["lactate"]["done_at"] = cl["started_at"]
-        text, kbd = _checklist_display(ctx.user_data["checklist"])
+            if pt.get("lactate") is not None:
+                pt["checklist"]["items"]["lactate"]["done"]    = True
+                pt["checklist"]["items"]["lactate"]["done_at"] = pt["checklist"]["started_at"]
+        text, kbd = _checklist_display(pt["checklist"])
         await q.message.reply_text(text, reply_markup=kbd)
 
     elif q.data == "checklist_reset":
-        ctx.user_data["checklist"] = {
+        pt["checklist"] = {
             "started_at": datetime.now(timezone.utc).timestamp(),
             "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
         }
-        text, kbd = _checklist_display(ctx.user_data["checklist"])
+        text, kbd = _checklist_display(pt["checklist"])
         await q.message.edit_text(text, reply_markup=kbd)
 
     elif q.data.startswith("checklist:"):
         item_id = q.data.split(":", 1)[1]
-        if "checklist" not in ctx.user_data:
-            ctx.user_data["checklist"] = {
+        if "checklist" not in pt:
+            pt["checklist"] = {
                 "started_at": datetime.now(timezone.utc).timestamp(),
                 "items": {iid: {"done": False} for iid, _ in CHECKLIST_ITEMS},
             }
-        cl = ctx.user_data["checklist"]
-        cl["items"][item_id] = {
+        pt["checklist"]["items"][item_id] = {
             "done":    True,
             "done_at": datetime.now(timezone.utc).timestamp(),
         }
-        text, kbd = _checklist_display(cl)
+        text, kbd = _checklist_display(pt["checklist"])
         await q.message.edit_text(text, reply_markup=kbd)
 
     elif q.data == "titrate_help":
@@ -2269,6 +2374,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def cmd_pt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    /pt        — список пациентов с кнопками переключения
+    /pt N      — переключиться на пациента N
+    /pt new    — создать нового пациента
+    """
+    _ensure_patients(ctx)
+    raw  = (update.message.text or "").strip()
+    args = re.sub(r"^/pt\S*\s*", "", raw, flags=re.I).strip().lower()
+
+    if args == "new":
+        new_id = max(ctx.user_data["patients"].keys()) + 1
+        ctx.user_data["patients"][new_id]  = {"lactate_history": []}
+        ctx.user_data["current_pt_id"]     = new_id
+        await update.message.reply_text(
+            f"Создан Пациент {new_id}. Введи данные.",
+            reply_markup=main_keyboard(ctx)
+        )
+        return
+
+    if args.isdigit():
+        new_id = int(args)
+        if new_id not in ctx.user_data["patients"]:
+            ctx.user_data["patients"][new_id] = {"lactate_history": []}
+        ctx.user_data["current_pt_id"] = new_id
+        await update.message.reply_text(
+            f"Переключено на Пациент {new_id}.",
+            reply_markup=main_keyboard(ctx)
+        )
+        return
+
+    # Без аргументов — показываем список
+    patients = ctx.user_data["patients"]
+    pid      = ctx.user_data.get("current_pt_id", 1)
+    lines    = ["👥 ПАЦИЕНТЫ\n"]
+    for p_id in sorted(patients.keys()):
+        p = patients[p_id]
+        has = any(k not in ("lactate_history", "delta_sofa") for k in p)
+        mark = "▶ " if p_id == pid else "  "
+        sofa = sofa_score(p) if has else "—"
+        apch = apache_score(p) if has else "—"
+        tag  = f"SOFA {sofa}  APACHE {apch}" if has else "(нет данных)"
+        lines.append(f"{mark}Пациент {p_id}: {tag}")
+
+    btns = []
+    for p_id in sorted(patients.keys()):
+        mark = "✓ " if p_id == pid else ""
+        btns.append([_IKB(f"{mark}Пациент {p_id}", f"pt_switch:{p_id}")])
+    btns.append([_IKB("➕ Новый пациент", "pt_new")])
+    btns.append([_IKB("← Главное меню",  "menu_main")])
+
+    await update.message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(btns)
+    )
+
+
 # =============================
 # ЗАПУСК
 # =============================
@@ -2283,6 +2445,7 @@ def main():
     app.add_handler(CommandHandler("titrate",   cmd_titrate))
     app.add_handler(CommandHandler("checklist", cmd_checklist))
     app.add_handler(CommandHandler("shift",     cmd_shift))
+    app.add_handler(CommandHandler("pt",        cmd_pt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.run_polling()
