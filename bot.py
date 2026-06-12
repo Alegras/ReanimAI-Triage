@@ -18,6 +18,16 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 # =============================
+# WATCHDOG — счётчики активности
+# =============================
+_stats: dict = {
+    "started_at": None,
+    "messages":   0,
+    "callbacks":  0,
+    "last_ok":    None,
+}
+
+# =============================
 # CONFIG — настраиваемые пороги
 # =============================
 CONFIG = {
@@ -2243,12 +2253,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Все данные есть → считаем ─────────────────────────────────
+    _stats["messages"] += 1
     await update.message.reply_text(_finalize(pt, ctx), reply_markup=main_keyboard(ctx))
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
+    _stats["callbacks"] += 1
     pt = get_pt(ctx)
 
     if q.data == "dash":
@@ -2554,6 +2566,37 @@ async def cmd_pt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # =============================
+# WATCHDOG — фоновая задача
+# =============================
+async def _watchdog_loop(app):
+    """Каждые 60 сек проверяет связь с Telegram и печатает heartbeat."""
+    _stats["started_at"] = datetime.now()
+    while True:
+        await asyncio.sleep(60)
+        try:
+            me = await app.bot.get_me()
+            _stats["last_ok"] = datetime.now()
+            uptime   = datetime.now() - _stats["started_at"]
+            total_s  = int(uptime.total_seconds())
+            h, rem   = divmod(total_s, 3600)
+            m        = rem // 60
+            print(
+                f"[✓ watchdog] {datetime.now().strftime('%H:%M')} | "
+                f"uptime {h}ч {m:02d}м | "
+                f"msgs: {_stats['messages']} | "
+                f"buttons: {_stats['callbacks']} | "
+                f"@{me.username}"
+            )
+        except Exception as e:
+            print(f"[⚠ watchdog] {datetime.now().strftime('%H:%M')} ОШИБКА: {e}")
+
+
+async def _post_init(app):
+    """Хук после инициализации приложения — запускаем watchdog."""
+    asyncio.create_task(_watchdog_loop(app))
+
+
+# =============================
 # ЗАПУСК
 # =============================
 async def error_handler(update, context):
@@ -2595,6 +2638,7 @@ def main():
         .connect_timeout(10)
         .read_timeout(10)
         .write_timeout(10)
+        .post_init(_post_init)
         .build()
     )
     app.add_handler(CommandHandler("start",     cmd_start))
