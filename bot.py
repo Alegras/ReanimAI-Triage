@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import asyncio
 from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, field_validator
@@ -2434,11 +2435,38 @@ async def cmd_pt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =============================
 # ЗАПУСК
 # =============================
+async def error_handler(update, context):
+    import telegram.error
+    if isinstance(context.error, telegram.error.Conflict):
+        await asyncio.sleep(5)
+        return
+    raise context.error
+
+
 def main():
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN не задан. Добавь его в секреты.")
 
-    app = ApplicationBuilder().token(TOKEN).build()
+    import time, urllib.request, json as _json
+    print("Ожидаю освобождения сессии Telegram (15 сек)...")
+    time.sleep(15)
+    try:
+        resp = urllib.request.urlopen(
+            f"https://api.telegram.org/bot{TOKEN}/getUpdates?offset=-1&timeout=0",
+            timeout=5,
+        )
+        print("Сессия свободна, стартую polling.")
+    except Exception:
+        pass
+
+    app = (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .connect_timeout(10)
+        .read_timeout(10)
+        .write_timeout(10)
+        .build()
+    )
     app.add_handler(CommandHandler("start",   cmd_start))
     app.add_handler(CommandHandler("export",  cmd_export))
     app.add_handler(CommandHandler("missing",   cmd_missing))
@@ -2448,7 +2476,13 @@ def main():
     app.add_handler(CommandHandler("pt",        cmd_pt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
+    app.add_error_handler(error_handler)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"],
+        poll_interval=2.0,
+        timeout=10,
+    )
 
 
 if __name__ == "__main__":
