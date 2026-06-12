@@ -1,6 +1,8 @@
 import os
 import re
 import math
+import sys
+import json
 import asyncio
 from datetime import datetime
 from typing import Optional
@@ -18,13 +20,36 @@ from telegram.ext import (
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 
 # =============================
+# ADMIN — постоянное хранилище chat_id
+# =============================
+ADMIN_FILE = "admin.json"
+
+
+def _load_admin_ids() -> set:
+    try:
+        with open(ADMIN_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _save_admin_ids(ids: set) -> None:
+    with open(ADMIN_FILE, "w") as f:
+        json.dump(list(ids), f)
+
+
+_admin_ids: set = _load_admin_ids()
+
+
+# =============================
 # WATCHDOG — счётчики активности
 # =============================
 _stats: dict = {
-    "started_at": None,
-    "messages":   0,
-    "callbacks":  0,
-    "last_ok":    None,
+    "started_at":    None,
+    "messages":      0,
+    "callbacks":     0,
+    "last_ok":       None,
+    "last_report_at": None,
 }
 
 # =============================
@@ -2568,32 +2593,147 @@ async def cmd_pt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =============================
 # WATCHDOG — фоновая задача
 # =============================
+def _uptime_str() -> str:
+    if not _stats["started_at"]:
+        return "—"
+    total_s = int((datetime.now() - _stats["started_at"]).total_seconds())
+    h, rem  = divmod(total_s, 3600)
+    m       = rem // 60
+    return f"{h}ч {m:02d}м"
+
+
+async def _notify_admins(app, text: str) -> None:
+    """Отправляет сообщение всем зарегистрированным админам."""
+    for cid in list(_admin_ids):
+        try:
+            await app.bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            print(f"[watchdog] не удалось уведомить {cid}: {e}")
+
+
 async def _watchdog_loop(app):
-    """Каждые 60 сек проверяет связь с Telegram и печатает heartbeat."""
-    _stats["started_at"] = datetime.now()
+    """
+    Каждые 60 сек: проверяет связь, логирует heartbeat.
+    При сбоях: уведомляет админов и перезапускает бот.
+    Каждые 12 ч: плановый отчёт в Telegram.
+    """
+    _stats["started_at"]    = datetime.now()
+    _stats["last_report_at"] = datetime.now()
+    fail_count = 0
+
     while True:
         await asyncio.sleep(60)
+
+        # ── проверка связи ──────────────────────────────────────────
         try:
             me = await app.bot.get_me()
             _stats["last_ok"] = datetime.now()
-            uptime   = datetime.now() - _stats["started_at"]
-            total_s  = int(uptime.total_seconds())
-            h, rem   = divmod(total_s, 3600)
-            m        = rem // 60
-            print(
+            fail_count = 0
+
+            uptime = _uptime_str()
+            line = (
                 f"[✓ watchdog] {datetime.now().strftime('%H:%M')} | "
-                f"uptime {h}ч {m:02d}м | "
+                f"uptime {uptime} | "
                 f"msgs: {_stats['messages']} | "
                 f"buttons: {_stats['callbacks']} | "
                 f"@{me.username}"
             )
+            print(line)
+
         except Exception as e:
-            print(f"[⚠ watchdog] {datetime.now().strftime('%H:%M')} ОШИБКА: {e}")
+            fail_count += 1
+            msg = f"[⚠ watchdog] {datetime.now().strftime('%H:%M')} ОШИБКА #{fail_count}: {e}"
+            print(msg)
+
+            if fail_count == 3:
+                alert = (
+                    f"⚠️ ICU Bot — потеря связи с Telegram!\n"
+                    f"Ошибка: {e}\n"
+                    f"Попытка #{fail_count} | uptime {_uptime_str()}"
+                )
+                await _notify_admins(app, alert)
+
+            if fail_count >= 5:
+                restart_msg = (
+                    f"🔄 ICU Bot — автоперезапуск после {fail_count} сбоев.\n"
+                    f"uptime до перезапуска: {_uptime_str()}"
+                )
+                print(f"[watchdog] перезапуск бота (os.execv)")
+                await _notify_admins(app, restart_msg)
+                await asyncio.sleep(2)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        # ── плановый отчёт каждые 12 ч ─────────────────────────────
+        if _admin_ids:
+            elapsed = (datetime.now() - _stats["last_report_at"]).total_seconds()
+            if elapsed >= 12 * 3600:
+                _stats["last_report_at"] = datetime.now()
+                report = (
+                    f"📊 ICU Bot — плановый отчёт\n"
+                    f"Время: {datetime.now().strftime('%d.%m %H:%M')}\n"
+                    f"Uptime: {_uptime_str()}\n"
+                    f"Сообщений обработано: {_stats['messages']}\n"
+                    f"Кнопок нажато: {_stats['callbacks']}\n"
+                    f"Последняя проверка: {_stats['last_ok'].strftime('%H:%M') if _stats['last_ok'] else '—'}"
+                )
+                await _notify_admins(app, report)
 
 
 async def _post_init(app):
     """Хук после инициализации приложения — запускаем watchdog."""
     asyncio.create_task(_watchdog_loop(app))
+
+
+# =============================
+# КОМАНДЫ АДМИНИСТРАТОРА
+# =============================
+async def cmd_setadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Регистрирует текущего пользователя как получателя уведомлений watchdog."""
+    cid = update.effective_chat.id
+    _admin_ids.add(cid)
+    _save_admin_ids(_admin_ids)
+    await update.message.reply_text(
+        f"✅ Ты зарегистрирован как администратор бота.\n"
+        f"Chat ID: {cid}\n\n"
+        f"Ты будешь получать:\n"
+        f"  • ⚠️ Уведомления при потере связи (3 сбоя подряд)\n"
+        f"  • 🔄 Сообщение перед автоперезапуском (5 сбоев)\n"
+        f"  • 📊 Плановый отчёт каждые 12 часов\n\n"
+        f"Отписаться: /removeadmin"
+    )
+
+
+async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Удаляет текущего пользователя из списка администраторов."""
+    cid = update.effective_chat.id
+    _admin_ids.discard(cid)
+    _save_admin_ids(_admin_ids)
+    await update.message.reply_text("❌ Ты удалён из списка администраторов.")
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Показывает текущий статус watchdog и статистику бота."""
+    last_ok = _stats["last_ok"]
+    last_ok_str = last_ok.strftime("%H:%M:%S") if last_ok else "нет данных"
+    started = _stats["started_at"]
+    started_str = started.strftime("%d.%m %H:%M") if started else "нет данных"
+    admin_count = len(_admin_ids)
+
+    await update.message.reply_text(
+        f"🖥 ICU Bot — статус\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ Uptime:         {_uptime_str()}\n"
+        f"🕐 Запущен:        {started_str}\n"
+        f"✅ Последняя проверка: {last_ok_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📨 Сообщений:      {_stats['messages']}\n"
+        f"🔘 Кнопок нажато: {_stats['callbacks']}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 Админов:        {admin_count}\n"
+        f"🔔 Уведомления:    {'вкл' if admin_count else 'выкл — сделай /setadmin'}\n"
+        f"♻️ Автоперезапуск: при 5 сбоях подряд\n"
+        f"📊 Плановый отчёт: каждые 12 ч"
+    )
 
 
 # =============================
@@ -2641,15 +2781,18 @@ def main():
         .post_init(_post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("help",      cmd_help))
-    app.add_handler(CommandHandler("export",    cmd_export))
-    app.add_handler(CommandHandler("missing",   cmd_missing))
-    app.add_handler(CommandHandler("trend",     cmd_trend))
-    app.add_handler(CommandHandler("titrate",   cmd_titrate))
-    app.add_handler(CommandHandler("checklist", cmd_checklist))
-    app.add_handler(CommandHandler("shift",     cmd_shift))
-    app.add_handler(CommandHandler("pt",        cmd_pt))
+    app.add_handler(CommandHandler("start",       cmd_start))
+    app.add_handler(CommandHandler("help",        cmd_help))
+    app.add_handler(CommandHandler("status",      cmd_status))
+    app.add_handler(CommandHandler("setadmin",    cmd_setadmin))
+    app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
+    app.add_handler(CommandHandler("export",      cmd_export))
+    app.add_handler(CommandHandler("missing",     cmd_missing))
+    app.add_handler(CommandHandler("trend",       cmd_trend))
+    app.add_handler(CommandHandler("titrate",     cmd_titrate))
+    app.add_handler(CommandHandler("checklist",   cmd_checklist))
+    app.add_handler(CommandHandler("shift",       cmd_shift))
+    app.add_handler(CommandHandler("pt",          cmd_pt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
