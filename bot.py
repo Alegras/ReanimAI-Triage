@@ -1589,6 +1589,7 @@ def reports_keyboard():
     return InlineKeyboardMarkup([
         [_IKB("📋 Пересменка",  "shift_report"),
          _IKB("📤 Экспорт CSV", "export_csv")],
+        [_IKB("📈 Динамика",    "trend_report")],
         [_IKB("← Главное меню", "menu_main")],
     ])
 
@@ -1677,11 +1678,33 @@ def skip_keyboard(field: str) -> InlineKeyboardMarkup:
 
 
 def _finalize(pt: dict, ctx) -> str:
-    """Вычисляем delta_sofa и возвращаем build_response."""
+    """Вычисляем delta_sofa, сохраняем снапшот и возвращаем build_response."""
     new_sofa = sofa_score(pt)
     base = pt.pop("_base_sofa", None)
     if base is not None:
         pt["delta_sofa"] = new_sofa - base
+    snap = {
+        "ts":         datetime.now().strftime("%H:%M"),
+        "sofa":       new_sofa,
+        "apache":     apache_score(pt),
+        "qsofa":      qsofa_score(pt),
+        "map":        pt.get("map"),
+        "hr":         pt.get("hr"),
+        "rr":         pt.get("rr"),
+        "temp":       pt.get("temp"),
+        "spo2":       pt.get("spo2"),
+        "gcs":        pt.get("gcs"),
+        "lactate":    pt.get("lactate"),
+        "creatinine": pt.get("creatinine"),
+        "bilirubin":  pt.get("bilirubin"),
+        "plt":        pt.get("plt"),
+        "ph":         pt.get("ph"),
+        "pf":         pf_ratio(pt),
+    }
+    snaps = pt.setdefault("_snapshots", [])
+    snaps.append(snap)
+    if len(snaps) > 5:
+        pt["_snapshots"] = snaps[-5:]
     return build_response(pt)
 
 
@@ -1952,10 +1975,104 @@ def build_shift_report(pt: dict) -> str:
     return "\n".join(lines)
 
 
+# =============================
+# ОТЧЁТ ДИНАМИКИ (/trend)
+# =============================
+def build_trend_report(pt: dict) -> str:
+    snaps = pt.get("_snapshots", [])
+    if len(snaps) < 2:
+        return (
+            "⚠️ Недостаточно данных для анализа динамики.\n\n"
+            "Введи новые данные после следующего осмотра — "
+            "бот сравнит два замера автоматически."
+        )
+    a, b = snaps[-2], snaps[-1]
+
+    # higher_better=True  → рост хорош (🟢↑), падение плохо (🔴↓)
+    # higher_better=False → рост плох  (🔴↑), падение хорошо (🟢↓)
+    FIELDS = [
+        # (ключ, метка, ед., higher_better, формат)
+        ("sofa",       "SOFA",          "",         False, ".0f"),
+        ("apache",     "APACHE II",     "",         False, ".0f"),
+        ("qsofa",      "qSOFA",         "",         False, ".0f"),
+        ("map",        "MAP",           "мм рт.ст", True,  ".0f"),
+        ("hr",         "ЧСС",          "уд/мин",   None,  ".0f"),
+        ("rr",         "ЧД",           "/мин",     False, ".0f"),
+        ("temp",       "Темп",         "°C",       None,  ".1f"),
+        ("spo2",       "SpO₂",         "%",        True,  ".0f"),
+        ("gcs",        "GCS",          "",         True,  ".0f"),
+        ("pf",         "P/F",          "",         True,  ".0f"),
+        ("lactate",    "Лактат",       "ммол/л",   False, ".1f"),
+        ("creatinine", "Креатинин",    "мкмол/л",  False, ".0f"),
+        ("bilirubin",  "Билирубин",    "мкмол/л",  False, ".0f"),
+        ("plt",        "Тромбоциты",  "×10⁹",     True,  ".0f"),
+        ("ph",         "pH",           "",         True,  ".2f"),
+    ]
+
+    def arrow(va, vb, hb):
+        diff = vb - va
+        if abs(diff) < 0.005 * max(abs(va), 1):
+            return "→", "⚪"
+        up = diff > 0
+        if hb is None:
+            return ("↑" if up else "↓"), "⚪"
+        good = (up and hb) or (not up and not hb)
+        return ("↑" if up else "↓"), ("🟢" if good else "🔴")
+
+    lines = [
+        "📈 ДИНАМИКА",
+        f"Замер 1: {a['ts']}  →  Замер 2: {b['ts']}",
+        "─" * 32,
+    ]
+    for key, label, unit, hb, fmt in FIELDS:
+        va, vb = a.get(key), b.get(key)
+        if va is None or vb is None:
+            continue
+        arr, icon = arrow(va, vb, hb)
+        diff = vb - va
+        sign = "+" if diff >= 0 else ""
+        diff_str = f"{sign}{diff:{fmt}}"
+        u = f" {unit}" if unit else ""
+        lines.append(
+            f"{icon}{arr} {label}{u}: {va:{fmt}} → {vb:{fmt}} ({diff_str})"
+        )
+    lines.append("─" * 32)
+    lines.append("🟢 = улучшение  🔴 = ухудшение  ⚪ = нейтрально")
+    return "\n".join(lines)
+
+
 async def cmd_shift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt     = get_pt(ctx)
     report = build_shift_report(pt)
     await update.message.reply_text(report)
+
+
+async def cmd_trend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    await update.message.reply_text(build_trend_report(pt))
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 КОМАНДЫ ICU CDSS\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "/start — новая сессия, сброс данных\n"
+        "/missing — список недостающих полей SOFA\n"
+        "/trend — динамика между двумя осмотрами\n"
+        "/shift — отчёт на пересменку\n"
+        "/checklist — Sepsis Bundle 1-hour checklist\n"
+        "/titrate — калькулятор титрования вазопрессора\n"
+        "/export — экспорт данных текущего пациента\n"
+        "/pt — управление пациентами (переключить/новый)\n"
+        "/help — эта справка\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Ввод свободным текстом:\n"
+        "  67 лет, АД 90/60, ЧД 28, GCS 12\n"
+        "  лактат 3.2, креатинин 280, тромбоциты 95\n"
+        "  PaO2 65 FiO2 0.5, pH 7.28\n"
+        "  норадреналин 0.15 мкг/кг/мин\n\n"
+        "Данные накапливаются — можно вводить частями."
+    )
 
 
 async def cmd_checklist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2211,6 +2328,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         report = build_shift_report(pt)
         await q.message.reply_text(report)
 
+    elif q.data == "trend_report":
+        await q.message.reply_text(build_trend_report(pt))
+
     elif q.data == "export_csv":
         if len([k for k in pt if k != "lactate_history"]) == 0:
             await q.message.reply_text("Нет данных для экспорта.")
@@ -2438,10 +2558,19 @@ async def cmd_pt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # =============================
 async def error_handler(update, context):
     import telegram.error
-    if isinstance(context.error, telegram.error.Conflict):
+    err = context.error
+    if isinstance(err, telegram.error.Conflict):
         await asyncio.sleep(5)
         return
-    raise context.error
+    print(f"[ERROR] {type(err).__name__}: {err}")
+    if update and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Произошла внутренняя ошибка при обработке запроса.\n"
+                "Попробуй ещё раз или нажми /start чтобы начать заново."
+            )
+        except Exception:
+            pass
 
 
 def main():
@@ -2468,9 +2597,11 @@ def main():
         .write_timeout(10)
         .build()
     )
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("export",  cmd_export))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("help",      cmd_help))
+    app.add_handler(CommandHandler("export",    cmd_export))
     app.add_handler(CommandHandler("missing",   cmd_missing))
+    app.add_handler(CommandHandler("trend",     cmd_trend))
     app.add_handler(CommandHandler("titrate",   cmd_titrate))
     app.add_handler(CommandHandler("checklist", cmd_checklist))
     app.add_handler(CommandHandler("shift",     cmd_shift))
