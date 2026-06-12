@@ -1541,7 +1541,8 @@ def build_export(pt):
 # =============================
 # КНОПКИ  (иерархическое меню)
 # =============================
-_IKB = InlineKeyboardButton   # сокращение
+def _IKB(text, cb):  # сокращение: второй аргумент всегда callback_data
+    return InlineKeyboardButton(text, callback_data=cb)
 
 
 def main_keyboard(ctx=None):
