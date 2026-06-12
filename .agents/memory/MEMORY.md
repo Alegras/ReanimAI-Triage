@@ -1,0 +1,3 @@
+- [ICU bot architecture](icu-bot-arch.md) — single bot.py, layered arch; new commands need handler + registration in main() + optional callback in handle_callback
+- [ICU bot parse fields](icu-bot-parse.md) — all parsed fields and how to add new ones to parse()/format_data()/build_response()
+- [ICU bot critical fixes](icu-bot-fixes.md) — known gotchas: _IKB positional bug, skip set in format_data, users.json tracking pattern

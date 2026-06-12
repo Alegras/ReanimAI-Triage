@@ -249,6 +249,29 @@ def parse(text, pt):
     if w:
         pt["weight"] = int(w.group(1))
 
+    # Седация / боль
+    rass_m = re.search(r"RASS\s*([+-]?\d+)", text, re.I)
+    if rass_m:
+        pt["rass"] = max(-5, min(4, int(rass_m.group(1))))
+    bps_m = re.search(r"BPS\s*(\d+)", text, re.I)
+    if bps_m:
+        pt["bps"] = max(3, min(12, int(bps_m.group(1))))
+
+    # Глюкоза
+    glu_m = re.search(r"(?:глюкоза|glucose|гл)\s*([\d.]+)", text, re.I)
+    if glu_m:
+        pt["glucose"] = float(glu_m.group(1))
+
+    # Жидкостный баланс: введено N мл / выведено N мл
+    intake_m = re.search(r"(?:введено|инфузия|в/в|intake)\s*(\d+)\s*мл", text, re.I)
+    if intake_m:
+        fl = pt.setdefault("fluids", {"intake": [], "output": []})
+        fl["intake"].append({"time": datetime.now().strftime("%H:%M"), "ml": int(intake_m.group(1))})
+    output_m = re.search(r"(?:выведено|вывод|output)\s*(\d+)\s*мл", text, re.I)
+    if output_m:
+        fl = pt.setdefault("fluids", {"intake": [], "output": []})
+        fl["output"].append({"time": datetime.now().strftime("%H:%M"), "ml": int(output_m.group(1))})
+
     # ── Вазопрессоры / инотропы ───────────────────────────────
     # Словарь: паттерн → каноническое имя
     _VASOPRESS_PAT = [
@@ -857,23 +880,44 @@ def alerts(pt) -> list[str]:
     T = CONFIG["thresholds"]
     a = []
 
+    # ── Критические (🔴) ──────────────────────────────────────
     if pt.get("map") is not None and pt["map"] < T["map_critical"]:
         a.append(f"🔴 КРИТИЧНО: MAP {pt['map']} — тяжёлая гипотензия")
     if pt.get("lactate", 0) >= T["lactate_critical"]:
         a.append(f"🔴 КРИТИЧНО: лактат {pt['lactate']} ммоль/л — тяжёлый шок")
     if pt.get("gcs") is not None and pt["gcs"] <= T["gcs_intubate"]:
         a.append(f"🔴 КРИТИЧНО: GCS {pt['gcs']} — риск аспирации, показания к интубации")
-
     pf = pf_ratio(pt)
     if pf is not None and pf < 100:
         a.append(f"🔴 КРИТИЧНО: PaO₂/FiO₂ {pf} — тяжёлый ARDS")
     if pt.get("ph") is not None and pt["ph"] < 7.15:
         a.append(f"🔴 КРИТИЧНО: pH {pt['ph']} — жизнеугрожающий ацидоз")
+    if pt.get("ph") is not None and pt["ph"] > 7.70:
+        a.append(f"🔴 КРИТИЧНО: pH {pt['ph']} — жизнеугрожающий алкалоз")
     if pt.get("potassium") is not None and pt["potassium"] >= 6.5:
         a.append(f"🔴 КРИТИЧНО: K⁺ {pt['potassium']} — риск остановки сердца")
+    if pt.get("potassium") is not None and pt["potassium"] < 2.5:
+        a.append(f"🔴 КРИТИЧНО: K⁺ {pt['potassium']} — тяжёлая гипокалиемия, риск аритмии")
+    if pt.get("sodium") is not None and pt["sodium"] < 120:
+        a.append(f"🔴 КРИТИЧНО: Na⁺ {pt['sodium']} — тяжёлая гипонатриемия")
+    if pt.get("sodium") is not None and pt["sodium"] > 160:
+        a.append(f"🔴 КРИТИЧНО: Na⁺ {pt['sodium']} — тяжёлая гипернатриемия")
+    if pt.get("plt") is not None and pt["plt"] < 20:
+        a.append(f"🔴 КРИТИЧНО: тромбоциты {pt['plt']} — риск спонтанного кровотечения")
     if pt.get("spo2") is not None and pt["spo2"] < 85:
         a.append(f"🔴 КРИТИЧНО: SpO₂ {pt['spo2']}%")
+    if pt.get("rr") is not None and pt["rr"] >= 40:
+        a.append(f"🔴 КРИТИЧНО: ЧД {pt['rr']} — крайняя дыхательная недостаточность")
+    if pt.get("hr") is not None and pt["hr"] < 40:
+        a.append(f"🔴 КРИТИЧНО: ЧСС {pt['hr']} — тяжёлая брадикардия")
+    if pt.get("hr") is not None and pt["hr"] > 160:
+        a.append(f"🔴 КРИТИЧНО: ЧСС {pt['hr']} — тяжёлая тахикардия")
+    if pt.get("glucose") is not None and pt["glucose"] < 2.8:
+        a.append(f"🔴 КРИТИЧНО: глюкоза {pt['glucose']} ммоль/л — тяжёлая гипогликемия")
+    if pt.get("glucose") is not None and pt["glucose"] > 22:
+        a.append(f"🔴 КРИТИЧНО: глюкоза {pt['glucose']} ммоль/л — гиперосмолярный криз")
 
+    # ── Предупреждения (🟡) ───────────────────────────────────
     if pt.get("map") is not None and T["map_critical"] <= pt["map"] < T["map_warn"]:
         a.append(f"🟡 ВНИМАНИЕ: MAP {pt['map']} — гипотензия")
     if pt.get("lactate", 0) >= T["lactate_warn"] and pt.get("lactate", 0) < T["lactate_critical"]:
@@ -882,6 +926,20 @@ def alerts(pt) -> list[str]:
         a.append(f"🟡 ВНИМАНИЕ: GCS {pt['gcs']} — нарушение сознания")
     if pt.get("creatinine", 0) >= T["creatinine_rrt"]:
         a.append(f"🟡 ВНИМАНИЕ: Кр-нин {pt['creatinine']} — рассмотреть ЗПТ")
+    if pt.get("potassium") is not None and 2.5 <= pt["potassium"] < 3.0:
+        a.append(f"🟡 ВНИМАНИЕ: K⁺ {pt['potassium']} — гипокалиемия")
+    if pt.get("potassium") is not None and 5.5 <= pt["potassium"] < 6.5:
+        a.append(f"🟡 ВНИМАНИЕ: K⁺ {pt['potassium']} — гиперкалиемия")
+    if pt.get("plt") is not None and 20 <= pt["plt"] < 50:
+        a.append(f"🟡 ВНИМАНИЕ: тромбоциты {pt['plt']} — тяжёлая тромбоцитопения")
+    if pt.get("glucose") is not None and 2.8 <= pt["glucose"] < 4.0:
+        a.append(f"🟡 ВНИМАНИЕ: глюкоза {pt['glucose']} — гипогликемия")
+    if pt.get("glucose") is not None and 10.0 < pt["glucose"] <= 22:
+        a.append(f"🟡 ВНИМАНИЕ: глюкоза {pt['glucose']} — гипергликемия, коррекция инсулином")
+    if pt.get("rass") is not None and pt["rass"] >= 2:
+        a.append(f"🟡 ВНИМАНИЕ: RASS {pt['rass']:+d} — возбуждение, коррекция седации")
+    if pt.get("bps") is not None and pt["bps"] >= 6:
+        a.append(f"🟡 ВНИМАНИЕ: BPS {pt['bps']} — боль, анальгезия недостаточна")
 
     return a
 
@@ -998,8 +1056,15 @@ def format_data(pt):
         "weight":     ("Вес",          "кг"),
         "norad_ml_h": ("Норадр. скор.","мл/ч"),
         "norad_mg":   ("Норадр. конц.","мг/50мл"),
+        "rass":       ("RASS",         ""),
+        "bps":        ("BPS",          ""),
+        "glucose":    ("Глюкоза",      "ммоль/л"),
     }
-    skip = {"sbp", "lactate_history", "delta_sofa"}
+    skip = {
+        "sbp", "lactate_history", "delta_sofa", "fluids",
+        "_snapshots", "skipped_fields", "waiting_for",
+        "_base_sofa", "checklist", "vasopressors", "target_doses",
+    }
     lines = []
     for k, v in pt.items():
         if k in skip:
@@ -1071,6 +1136,21 @@ def build_response(pt):
         lines.append(f"📉 Лактат-клиренс: {lc}% {trend}")
     if delta_sofa is not None:
         lines.append(f"📈 ΔSOFA: {delta_sofa:+d} — {'ухудшение' if delta_sofa > 0 else 'улучшение' if delta_sofa < 0 else 'стабильно'}")
+
+    # Седация / боль / глюкоза
+    extra = []
+    if pt.get("rass") is not None:
+        rass_labels = {-5:"неотвечает",-4:"глубокая седация",-3:"умеренная седация",
+                       -2:"лёгкая седация",-1:"сонливость",0:"бодр/спокоен",
+                       1:"беспокойство",2:"возбуждение",3:"сильное возбуждение",4:"агрессия"}
+        extra.append(f"💤 RASS: {pt['rass']:+d} ({rass_labels.get(pt['rass'],'')})")
+    if pt.get("bps") is not None:
+        bps_txt = "норма" if pt["bps"] <= 3 else ("умеренная боль" if pt["bps"] <= 5 else "сильная боль")
+        extra.append(f"😣 BPS: {pt['bps']} — {bps_txt}")
+    if pt.get("glucose") is not None:
+        extra.append(f"🩸 Глюкоза: {pt['glucose']} ммоль/л")
+    if extra:
+        lines += extra
 
     if acts:
         lines.append("\n✅ Решения:")
@@ -1607,6 +1687,8 @@ def protocols_keyboard():
          _IKB("🧪 ABG",            "abg")],
         [_IKB("📉 Лактат",         "lac"),
          _IKB("🦠 Sepsis Bundle",  "checklist_open")],
+        [_IKB("💧 Жидкостный баланс", "balance"),
+         _IKB("💊 Антибиотики",       "abx_open")],
         [_IKB("← Главное меню",    "menu_main")],
     ])
 
@@ -2076,6 +2158,363 @@ def build_trend_report(pt: dict) -> str:
     return "\n".join(lines)
 
 
+# =============================
+# ЖИДКОСТНЫЙ БАЛАНС
+# =============================
+def build_fluid_balance(pt) -> str:
+    fl = pt.get("fluids", {"intake": [], "output": []})
+    intake_total = sum(e["ml"] for e in fl.get("intake", []))
+    output_total = sum(e["ml"] for e in fl.get("output", []))
+    balance = intake_total - output_total
+    bal_icon = "🟡" if abs(balance) > 1000 else ("🔴" if abs(balance) > 2000 else "🟢")
+
+    lines = ["💧 ЖИДКОСТНЫЙ БАЛАНС", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+
+    lines.append("📥 ВВЕДЕНО:")
+    if fl.get("intake"):
+        for e in fl["intake"]:
+            note = f"  [{e.get('note','')}]" if e.get("note") else ""
+            lines.append(f"  {e.get('time','')}  {e['ml']} мл{note}")
+    else:
+        lines.append("  (нет данных)")
+    lines.append(f"  ИТОГО: {intake_total} мл")
+
+    lines.append("📤 ВЫВЕДЕНО:")
+    if fl.get("output"):
+        for e in fl["output"]:
+            note = f"  [{e.get('note','')}]" if e.get("note") else ""
+            lines.append(f"  {e.get('time','')}  {e['ml']} мл{note}")
+    else:
+        # Используем диурез из основных данных, если есть
+        if pt.get("uop") and pt.get("weight"):
+            uop_ml = round(pt["uop"] * pt["weight"] * 12)
+            lines.append(f"  диурез (расчётно 12ч): ~{uop_ml} мл")
+            output_total = uop_ml
+            balance = intake_total - output_total
+        else:
+            lines.append("  (нет данных)")
+
+    lines.append(f"  ИТОГО: {output_total} мл")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    sign = "+" if balance >= 0 else ""
+    lines.append(f"{bal_icon} БАЛАНС: {sign}{balance} мл")
+    if balance > 2000:
+        lines.append("⚠️ Положительный баланс >2л — риск отёка лёгких")
+    elif balance < -500:
+        lines.append("⚠️ Отрицательный баланс — риск гиповолемии")
+    lines.append("\nДля добавления введи в чат:")
+    lines.append("  введено 500 мл")
+    lines.append("  выведено 300 мл")
+    return "\n".join(lines)
+
+
+async def cmd_balance(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    await update.message.reply_text(build_fluid_balance(pt))
+
+
+# =============================
+# RASS / BPS (СЕДАЦИЯ / БОЛЬ)
+# =============================
+RASS_TABLE = (
+    "💤 ШКАЛА RASS (ажитация-седация)\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "+4  Агрессия: агрессивен, опасен для персонала\n"
+    "+3  Сильное возбуждение: тянет катетеры, борется с ИВЛ\n"
+    "+2  Возбуждение: беспокоен, частые движения\n"
+    "+1  Беспокойство: тревожен, но движения не агрессивны\n"
+    " 0  Бодрый и спокойный\n"
+    "-1  Сонливость: не полностью бодр, но пробуждается (>10с)\n"
+    "-2  Лёгкая седация: пробуждается <10с на голос\n"
+    "-3  Умеренная седация: движения на голос, без глазного контакта\n"
+    "-4  Глубокая седация: нет ответа на голос, движения на боль\n"
+    "-5  Не отвечает: нет ответа на голос или боль\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Целевая RASS: от -2 до -1 (умеренная седация)\n"
+    "Нажми кнопку или введи: RASS -2"
+)
+
+BPS_TABLE = (
+    "😣 ШКАЛА BPS (боль у неконтактного пациента)\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Выражение лица:  расслаб=1, напряжение=2, гримаса=3, крик=4\n"
+    "Движения рук:   нет=1, частичные=2, полный сгиб=3, постоянный=4\n"
+    "ИВЛ-синхрон:   синхрон=1, кашель±=2, борется=3, невозможно=4\n"
+    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    "Сумма 3-12. Цель: ≤5 (нет значимой боли)\n"
+    "Введи: BPS 5"
+)
+
+
+def rass_keyboard():
+    """Inline клавиатура выбора RASS."""
+    rows = []
+    row1 = [_IKB(f"+{v}", f"rass_set:{v}") for v in (4, 3, 2, 1)]
+    row2 = [_IKB("0", "rass_set:0")]
+    row3 = [_IKB(f"{v:+d}", f"rass_set:{v}") for v in (-1, -2, -3, -4, -5)]
+    rows = [row1, row2, row3]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_rass(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    cur = pt.get("rass")
+    cur_txt = f"\n\n▶ Текущий RASS: {cur:+d}" if cur is not None else ""
+    await update.message.reply_text(
+        RASS_TABLE + cur_txt,
+        reply_markup=rass_keyboard()
+    )
+
+
+# =============================
+# НУТРИТИВНАЯ ПОДДЕРЖКА
+# =============================
+def calc_nutrition(pt) -> str:
+    age    = pt.get("age")
+    weight = pt.get("weight")
+    height = pt.get("height")
+    sofa   = sofa_score(pt)
+    cr     = pt.get("creatinine")
+
+    if not all([age, weight]):
+        return (
+            "⚠️ Для расчёта нутриции нужны: возраст, вес (и желательно рост).\n"
+            "Пример: 65 лет, вес 75, рост 170"
+        )
+
+    # ── REE по Mifflin–St Jeor (пол неизвестен — усреднение) ──
+    h = height or (weight * 2.5 + 100)  # грубая оценка если нет роста
+    ree_m = 10 * weight + 6.25 * h - 5 * age + 5
+    ree_f = 10 * weight + 6.25 * h - 5 * age - 161
+    ree = round((ree_m + ree_f) / 2)  # среднее (пол не известен)
+
+    # ── Стресс-фактор ───────────────────────────────────────────
+    if sofa >= 11:
+        sf, sf_name = 1.0, "гиперметаболизм — не превышать 100% REE при остром PICS"
+    elif sofa >= 8:
+        sf, sf_name = 1.1, "тяжёлый — умеренная гипокалорийность"
+    elif sofa >= 5:
+        sf, sf_name = 1.25, "среднетяжёлый"
+    else:
+        sf, sf_name = 1.4, "лёгкий/умеренный"
+
+    total_kcal = round(ree * sf)
+    protein_lo = round(weight * 1.5, 1)
+    protein_hi = round(weight * 2.0, 1)
+
+    # ── Поправка на почки ───────────────────────────────────────
+    renal_note = ""
+    if cr and cr > 300:
+        protein_lo = round(weight * 0.8, 1)
+        protein_hi = round(weight * 1.2, 1)
+        renal_note = "\n⚠️ ХПН/ОПН без ЗПТ — белок ограничен до 0.8–1.2 г/кг/сут"
+    elif cr and cr > 150:
+        renal_note = "\n💡 Повышенный креатинин — при ЗПТ белок до 1.7–2.5 г/кг/сут"
+
+    # ── Скорость кормления ──────────────────────────────────────
+    rate_lo = round(total_kcal / 1.0 / 24)  # 1 ккал/мл, мл/ч
+    rate_hi = round(total_kcal / 0.8 / 24)  # 1.25 ккал/мл питательные смеси
+
+    lines = [
+        "🍽 НУТРИТИВНАЯ ПОДДЕРЖКА",
+        "━━━━━━━━━━━━━━━━━━━━━━━━",
+        f"Пациент: {age} лет, {weight} кг, рост {int(h)} см",
+        f"REE (Mifflin): ~{ree} ккал/сут",
+        f"Стресс-фактор: ×{sf} ({sf_name})",
+        f"📊 Целевая калорийность: {total_kcal} ккал/сут",
+        f"🥩 Белок: {protein_lo}–{protein_hi} г/сут ({protein_lo/weight:.1f}–{protein_hi/weight:.1f} г/кг)",
+        f"💧 Скорость зондового питания: {rate_lo}–{rate_hi} мл/ч",
+        "",
+        "Протокол (5 дней ОРИТ):",
+        "  Дни 1-3: 50–70% от целевой",
+        "  Дни 4-5: 80–100% от целевой",
+        "  Глюкоза крови: 6–10 ммоль/л",
+        "  Назначь: Нутрикомп/Нутризон 1.0–1.25 ккал/мл",
+        renal_note,
+        "",
+        "* Пол неизвестен: используется среднее M/Ж.",
+        "  Введи пол (мужской/женский) для точного расчёта.",
+    ]
+    return "\n".join(l for l in lines if l is not None)
+
+
+async def cmd_nutrition(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    await update.message.reply_text(calc_nutrition(pt))
+
+
+# =============================
+# ИСТОРИЯ ОСМОТРОВ
+# =============================
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    snaps = pt.get("_snapshots", [])
+    if not snaps:
+        await update.message.reply_text(
+            "📋 История пустая. Данные появятся после первого расчёта.\n"
+            "Введи данные пациента и нажми «Пересчитать»."
+        )
+        return
+
+    lines = ["📋 ИСТОРИЯ ОСМОТРОВ", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    for i, snap in enumerate(snaps, 1):
+        ts   = snap.get("_ts", "—")
+        sofa = sofa_score(snap)
+        apch = apache_score(snap)
+        lac  = snap.get("lactate", "—")
+        mp   = snap.get("map", "—")
+        gcs  = snap.get("gcs", "—")
+        rass = snap.get("rass")
+        rass_str = f"  RASS {rass:+d}" if rass is not None else ""
+        lev  = triage_level(snap, apch, sofa)
+        lvl_emoji = lev.split()[0] if lev else ""
+        lines.append(
+            f"\n[{i}] {ts} {lvl_emoji}\n"
+            f"  APACHE II: {apch}  SOFA: {sofa}\n"
+            f"  MAP: {mp}  GCS: {gcs}  Лактат: {lac}{rass_str}"
+        )
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"Всего осмотров: {len(snaps)}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# =============================
+# АНТИБИОТИКИ (расчёт доз по CrCl)
+# =============================
+_ABX_TABLE = [
+    # (препарат, норма, CrCl>50, CrCl30-50, CrCl10-29, CrCl<10, примечание)
+    ("Меропенем",           "1г q8h",    "1г q8h",     "1г q12h",     "0.5г q12h",  "0.5г q24h",   ""),
+    ("Имипенем",            "0.5г q6h",  "0.5г q6h",   "0.5г q8h",    "0.25г q8h",  "0.25г q12h",  ""),
+    ("Пипер/тазобактам",    "4.5г q6h",  "4.5г q6h",   "4.5г q8h",    "2.25г q8h",  "2.25г q12h",  ""),
+    ("Цефтриаксон",         "2г q24h",   "2г q24h",     "2г q24h",     "2г q24h",    "2г q24h",     "без коррекции"),
+    ("Цефепим",             "2г q8h",    "2г q8h",      "2г q12h",     "1г q12h",    "0.5г q24h",   ""),
+    ("Ванкомицин",          "25мг/кг нагрузка, затем 15мг/кг q12h",
+                                         "по уровню",   "по уровню",   "по уровню",  "по уровню",   "TDM обязателен, цель AUC 400-600"),
+    ("Амикацин",            "15мг/кг q24h", "15мг/кг q24h", "10мг/кг q24h", "7.5мг/кг q36h", "TDM",   "TDM, цель Cpeak 60-80"),
+    ("Гентамицин",          "5мг/кг q24h",  "5мг/кг q24h",  "3мг/кг q24h",  "мониторинг",   "TDM",   "TDM"),
+    ("Колистин",            "9 MU нагрузка, поддержка по CrCl",
+                                         "9MU→3MU q8h", "9MU→2MU q12h","9MU→2MU q24h","непостоянно", "TDM при возможности"),
+    ("Ципрофлоксацин",      "400мг q8h", "400мг q8h",   "400мг q12h",  "200мг q12h", "200мг q24h",  ""),
+    ("Метронидазол",        "500мг q8h", "500мг q8h",   "500мг q8h",   "500мг q8h",  "500мг q12h",  ""),
+    ("Флуконазол",          "400мг q24h","400мг q24h",  "200мг q24h",  "200мг q24h", "200мг q48h",  ""),
+    ("Линезолид",           "600мг q12h","600мг q12h",  "600мг q12h",  "600мг q12h", "600мг q12h",  "без коррекции"),
+    ("Тигециклин",          "100мг нагр, 50мг q12h",
+                                         "без коррекции","без коррекции","без коррекции","без коррекции","ТПН: снизить до 25мг q12h"),
+]
+
+
+def _calc_crcl(pt) -> str | None:
+    """Cockcroft-Gault. Возвращает строку с CrCl или None."""
+    age = pt.get("age")
+    weight = pt.get("weight")
+    cr = pt.get("creatinine")
+    if not all([age, weight, cr]):
+        return None
+    cr_mg = cr / 88.4
+    crcl = (140 - age) * weight / (72 * cr_mg)
+    return round(crcl)
+
+
+def build_abx_report(pt) -> str:
+    crcl = _calc_crcl(pt)
+    lines = ["💊 АНТИБИОТИКИ — ПОДБОР ДОЗ", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+
+    if crcl is not None:
+        if crcl >= 50:
+            tier, col = "нормальная функция (CrCl ≥50)", 1
+        elif crcl >= 30:
+            tier, col = f"умеренная ХПН (CrCl {crcl})", 2
+        elif crcl >= 10:
+            tier, col = f"тяжёлая ХПН (CrCl {crcl})", 3
+        else:
+            tier, col = f"диализ/ОПН (CrCl {crcl})", 4
+
+        lines.append(f"🔬 CrCl (Cockcroft-Gault): {crcl} мл/мин")
+        lines.append(f"📊 Категория: {tier}")
+        lines.append("")
+        lines.append("Препарат                Доза для данного пациента")
+        lines.append("─────────────────────────────────────────────────")
+        for row in _ABX_TABLE:
+            drug, norm, d50, d30, d10, d0, note = row
+            doses = [norm, d50, d30, d10, d0]
+            dose = doses[col]
+            note_str = f"  [{note}]" if note else ""
+            lines.append(f"  {drug:<22} {dose}{note_str}")
+        lines.append("")
+        lines.append("* CrCl рассчитан по Cockcroft-Gault")
+        lines.append("* TDM — терапевтический мониторинг концентрации")
+    else:
+        miss = []
+        if not pt.get("age"):      miss.append("возраст")
+        if not pt.get("weight"):   miss.append("вес")
+        if not pt.get("creatinine"): miss.append("креатинин")
+        lines.append(f"⚠️ Для расчёта CrCl нужны: {', '.join(miss)}")
+        lines.append("Пример: 65 лет, вес 75, креатинин 180")
+        lines.append("")
+        lines.append("── Стандартные дозы (без коррекции) ──")
+        for row in _ABX_TABLE:
+            drug, norm = row[0], row[1]
+            lines.append(f"  {drug:<22} {norm}")
+
+    lines.append("\n⚠️ Дозы — ориентировочные. Верифицируй по локальным протоколам.")
+    return "\n".join(lines)
+
+
+async def cmd_abx(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    pt = get_pt(ctx)
+    await update.message.reply_text(build_abx_report(pt))
+
+
+# =============================
+# BROADCAST (рассылка, только админ)
+# =============================
+_USERS_FILE = "users.json"
+
+def _load_users() -> set:
+    try:
+        with open(_USERS_FILE) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+def _save_users(ids: set) -> None:
+    try:
+        with open(_USERS_FILE, "w") as f:
+            json.dump(list(ids), f)
+    except Exception:
+        pass
+
+_user_ids: set = _load_users()
+
+
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cid = update.effective_chat.id
+    if cid not in _admin_ids:
+        await update.message.reply_text("⛔ Только администраторы могут делать рассылку.")
+        return
+
+    raw  = (update.message.text or "").strip()
+    text = re.sub(r"^/broadcast\S*\s*", "", raw, flags=re.I).strip()
+    if not text:
+        await update.message.reply_text(
+            "Использование: /broadcast <текст>\n"
+            f"Зарегистрировано пользователей: {len(_user_ids)}"
+        )
+        return
+
+    sent = 0
+    failed = 0
+    for uid in list(_user_ids):
+        try:
+            await ctx.bot.send_message(chat_id=uid, text=f"📢 ОПОВЕЩЕНИЕ ICU:\n\n{text}")
+            sent += 1
+        except Exception:
+            failed += 1
+    await update.message.reply_text(
+        f"✅ Рассылка завершена.\nОтправлено: {sent}  |  Ошибок: {failed}"
+    )
+
+
 async def cmd_shift(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     pt     = get_pt(ctx)
     report = build_shift_report(pt)
@@ -2091,22 +2530,39 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📋 КОМАНДЫ ICU CDSS\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "/start — новая сессия, сброс данных\n"
-        "/missing — список недостающих полей SOFA\n"
-        "/trend — динамика между двумя осмотрами\n"
+        "КЛИНИЧЕСКИЕ РАСЧЁТЫ\n"
+        "/missing — недостающие поля SOFA\n"
+        "/trend — динамика между осмотрами (🟢/🔴)\n"
         "/shift — отчёт на пересменку\n"
-        "/checklist — Sepsis Bundle 1-hour checklist\n"
-        "/titrate — калькулятор титрования вазопрессора\n"
-        "/export — экспорт данных текущего пациента\n"
-        "/pt — управление пациентами (переключить/новый)\n"
-        "/help — эта справка\n"
+        "/history — история всех осмотров\n"
+        "/checklist — Sepsis Bundle 1-hour\n"
+        "/titrate — титрование вазопрессора\n"
+        "\nСЕДАЦИЯ И БОЛЬ\n"
+        "/rass — шкала RASS (-5..+4), установить оценку\n"
+        "\nЖИДКОСТЬ И ПИТАНИЕ\n"
+        "/balance — жидкостный баланс (введено/выведено)\n"
+        "/nutrition — нутритивная поддержка (REE, белок, скорость)\n"
+        "\nАНТИБИОТИКИ\n"
+        "/abx — дозы с коррекцией на CrCl (Cockcroft-Gault)\n"
+        "\nЭКСПОРТ\n"
+        "/export — экспорт данных пациента\n"
+        "\nПАЦИЕНТЫ\n"
+        "/pt — список / переключить / новый пациент\n"
+        "/start — сброс данных текущего пациента\n"
+        "\nАДМИН\n"
+        "/setadmin — стать администратором бота\n"
+        "/removeadmin — снять права\n"
+        "/status — статус watchdog и uptime\n"
+        "/broadcast <текст> — рассылка всем пользователям\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "Ввод свободным текстом:\n"
+        "СВОБОДНЫЙ ТЕКСТОВЫЙ ВВОД:\n"
         "  67 лет, АД 90/60, ЧД 28, GCS 12\n"
         "  лактат 3.2, креатинин 280, тромбоциты 95\n"
-        "  PaO2 65 FiO2 0.5, pH 7.28\n"
-        "  норадреналин 0.15 мкг/кг/мин\n\n"
-        "Данные накапливаются — можно вводить частями."
+        "  PaO2 65 FiO2 0.5, pH 7.28, глюкоза 8.5\n"
+        "  норадреналин 0.15 мкг/кг/мин\n"
+        "  RASS -2, BPS 4\n"
+        "  введено 500 мл / выведено 300 мл\n\n"
+        "Данные накапливаются — вводи частями между осмотрами."
     )
 
 
@@ -2232,6 +2688,12 @@ async def cmd_missing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Трекинг пользователей для рассылки
+    cid = update.effective_chat.id
+    if cid not in _user_ids:
+        _user_ids.add(cid)
+        _save_users(_user_ids)
+
     pt      = get_pt(ctx)
     text    = update.message.text.strip()
     skipped = pt.setdefault("skipped_fields", set())
@@ -2410,6 +2872,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["current_pt_id"] = new_id
         await q.message.edit_reply_markup(reply_markup=main_keyboard(ctx))
         await q.message.reply_text(f"Переключено на Пациент {new_id}.")
+
+    elif q.data == "balance":
+        await q.message.reply_text(build_fluid_balance(pt))
+
+    elif q.data == "abx_open":
+        await q.message.reply_text(build_abx_report(pt))
+
+    elif q.data.startswith("rass_set:"):
+        val = int(q.data.split(":", 1)[1])
+        pt["rass"] = val
+        rass_labels = {-5:"неотвечает",-4:"глубокая седация",-3:"умеренная седация",
+                       -2:"лёгкая седация",-1:"сонливость",0:"бодр/спокоен",
+                       1:"беспокойство",2:"возбуждение",3:"сильное возбуждение",4:"агрессия"}
+        await q.message.reply_text(
+            f"✅ RASS установлен: {val:+d} — {rass_labels.get(val,'')}\n"
+            f"Данные обновлены. /rass для изменения."
+        )
 
     elif q.data == "checklist_open":
         if "checklist" not in pt:
@@ -2793,6 +3272,12 @@ def main():
     app.add_handler(CommandHandler("checklist",   cmd_checklist))
     app.add_handler(CommandHandler("shift",       cmd_shift))
     app.add_handler(CommandHandler("pt",          cmd_pt))
+    app.add_handler(CommandHandler("balance",     cmd_balance))
+    app.add_handler(CommandHandler("rass",        cmd_rass))
+    app.add_handler(CommandHandler("nutrition",   cmd_nutrition))
+    app.add_handler(CommandHandler("history",     cmd_history))
+    app.add_handler(CommandHandler("abx",         cmd_abx))
+    app.add_handler(CommandHandler("broadcast",   cmd_broadcast))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_error_handler(error_handler)
