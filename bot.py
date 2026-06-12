@@ -2448,7 +2448,7 @@ def main():
     app.add_handler(CommandHandler("pt",        cmd_pt))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
